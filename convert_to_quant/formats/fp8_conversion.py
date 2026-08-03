@@ -357,6 +357,8 @@ def convert_to_fp8_scaled(
                     layer_format = "mxfp8"
                 elif fmt == "nvfp4":
                     layer_format = "nvfp4"
+                elif fmt in ("int4", "convrot_w4a4"):
+                    layer_format = "convrot_w4a4"
                 else:
                     layer_format = "fp8"  # fallback
 
@@ -466,6 +468,7 @@ def convert_to_fp8_scaled(
         is_int8 = layer_format == "int8"
         is_mxfp8 = layer_format == "mxfp8"
         is_nvfp4 = layer_format == "nvfp4"
+        is_int4 = layer_format in ("int4", "convrot_w4a4")
 
         # Extract block depth from key (look for .0. .1. etc patterns)
         depth = -1
@@ -476,7 +479,7 @@ def convert_to_fp8_scaled(
         # Check if convrot was effectively applied by this converter
         convrot_applied = False
         convrot_group_size = 256
-        if hasattr(converter, "convrot") and getattr(converter, "convrot") and getattr(converter, "scaling_mode", "") == "row":
+        if is_int4 or (hasattr(converter, "convrot") and getattr(converter, "convrot") and getattr(converter, "scaling_mode", "") == "row"):
             in_features = original_tensor.shape[1]
             dynamic_convrot = getattr(converter, "dynamic_convrot", False)
             if dynamic_convrot:
@@ -562,6 +565,17 @@ def convert_to_fp8_scaled(
                 comfy_quant_format = "nvfp4"
                 block_size_for_meta = 16  # NVFP4 fixed block size
                 comfy_quant_tensor = create_comfy_quant_tensor("nvfp4", block_size=16, full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None)
+            elif is_int4:
+                new_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
+                comfy_quant_format = "convrot_w4a4"
+                block_size_for_meta = layer_block_size
+                comfy_quant_tensor = create_comfy_quant_tensor(
+                    "convrot_w4a4",
+                    block_size=block_size_for_meta,
+                    full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None,
+                    convrot=True,
+                    convrot_groupsize=convrot_group_size if convrot_applied else 256,
+                )
             elif is_int8:
                 new_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
                 if converter.scaling_mode in ("tensor", "row"):
@@ -621,14 +635,14 @@ def convert_to_fp8_scaled(
             if save_quant_metadata:
                 # Reconstruct the dict that was used to create the tensor
                 meta_entry = {"format": comfy_quant_format}
-                block_based_formats = {"int8_blockwise", "float8_e4m3fn_blockwise", "mxfp8", "nvfp4"}
+                block_based_formats = {"int8_blockwise", "float8_e4m3fn_blockwise", "mxfp8", "nvfp4", "convrot_w4a4"}
                 if block_size_for_meta is not None and comfy_quant_format in block_based_formats:
                     meta_entry["group_size"] = block_size_for_meta
                 if layer_full_precision_mm:
                     meta_entry["full_precision_matrix_mult"] = True
-                if convrot_applied:
+                if is_int4 or convrot_applied:
                     meta_entry["convrot"] = True
-                    meta_entry["convrot_groupsize"] = convrot_group_size
+                    meta_entry["convrot_groupsize"] = convrot_group_size if convrot_applied else 256
 
                 quant_metadata_layers[base_name] = meta_entry
 

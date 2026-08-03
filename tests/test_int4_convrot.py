@@ -96,3 +96,37 @@ def test_learned_int4_converter_with_optimization():
     assert scale.shape == (16,)
     assert dequantized.shape == weight.shape
 
+
+def test_convert_to_fp8_scaled_int4_comfy_quant(tmp_path):
+    from safetensors.torch import save_file, safe_open
+    from convert_to_quant.formats.fp8_conversion import convert_to_fp8_scaled
+
+    in_file = str(tmp_path / "model.safetensors")
+    out_file = str(tmp_path / "model_int4.safetensors")
+
+    weights = {
+        "layer1.weight": torch.randn(16, 256, dtype=torch.float32),
+        "layer1.bias": torch.randn(16, dtype=torch.float32),
+    }
+    save_file(weights, in_file)
+
+    convert_to_fp8_scaled(
+        input_file=in_file,
+        output_file=out_file,
+        comfy_quant=True,
+        filter_flags={},
+        calib_samples=1,
+        seed=42,
+        primary_format="int4",
+        no_learned_rounding=True,
+    )
+
+    with safe_open(out_file, framework="pt", device="cpu") as f:
+        tensor_keys = list(f.keys())
+        assert "layer1.comfy_quant" in tensor_keys
+        cq_tensor = f.get_tensor("layer1.comfy_quant")
+        cq_dict = tensor_to_dict(cq_tensor)
+        assert cq_dict["format"] == "convrot_w4a4"
+        assert cq_dict["format"] != "float8_e4m3fn_rowwise"
+
+
