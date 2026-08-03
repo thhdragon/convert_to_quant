@@ -1,9 +1,9 @@
 """
 Base converter class for learned rounding quantization.
 
-Provides shared infrastructure for LearnedRoundingConverter (FP8/INT8)
-and LearnedNVFP4Converter (NVFP4). Contains common initialization,
-SVD computation, LR scheduling, and early stopping logic.
+Provides shared infrastructure for learned rounding quantization.
+Contains common initialization, SVD computation, LR scheduling,
+and early stopping logic.
 """
 
 import gc

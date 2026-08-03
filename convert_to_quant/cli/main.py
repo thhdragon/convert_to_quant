@@ -113,7 +113,9 @@ def analyze_dry_run(args) -> None:
     layer_config = load_layer_config(args.layer_config) if args.layer_config else None
     filter_flags = extract_filter_flags(args)
 
-    if args.nvfp4:
+    if getattr(args, "int4", False):
+        primary_format = "int4"
+    elif args.nvfp4:
         primary_format = "nvfp4"
     elif args.mxfp8:
         primary_format = "mxfp8"
@@ -121,6 +123,7 @@ def analyze_dry_run(args) -> None:
         primary_format = "int8"
     else:
         primary_format = "fp8"
+
 
     routes = {}
     passthrough_count = 0
@@ -253,10 +256,12 @@ def get_parser() -> MultiHelpArgumentParser:
         "--comfy_quant", "--comfy-quant", action="store_true", dest="comfy_quant", help="Use Comfy quantization method."
     )
     parser.add_argument("--int8", action="store_true", help="Use INT8 block-wise quantization instead of FP8.")
+    parser.add_argument("-4", "--int4", "--w4a4", action="store_true", dest="int4", help="Use INT4 W4A4 ConvRot quantization.")
     parser.add_argument(
         "--convrot", action="store_true",
-        help="Enable group-wise Hadamard rotation (ConvRot) for INT8 row-wise quantization to improve quality."
+        help="Enable group-wise Hadamard rotation (ConvRot) for INT8/INT4 row-wise quantization to improve quality."
     )
+
     parser.add_argument(
         "--convrot-group-size", "--convrot_group_size", type=int, default=256, dest="convrot_group_size",
         help="Group size for ConvRot (must be power of 4: 4, 16, 64, 256, 1024). Default: 256"
@@ -1147,13 +1152,16 @@ def run_conversion(args):
     if args.layer_config:
         layer_config_data = load_layer_config(args.layer_config)
 
-    # Call convert_to_fp8_scaled with explicit args (no **kwargs footgun)
-    # Determine primary_format for NVFP4/MXFP8 mixed mode (when they fall through here)
+    # Determine primary_format for INT4/NVFP4/MXFP8 mode
     primary_format = None
-    if args.nvfp4 and (args.custom_type or args.fallback or args.layer_config):
+    if getattr(args, "int4", False):
+        primary_format = "int4"
+        args.convrot = True
+    elif args.nvfp4 and (args.custom_type or args.fallback or args.layer_config):
         primary_format = "nvfp4"
     elif args.mxfp8 and (args.custom_type or args.fallback or args.layer_config):
         primary_format = "mxfp8"
+
 
     convert_to_fp8_scaled(
         args.input,

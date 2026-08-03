@@ -90,27 +90,28 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         self.scale_optimization = scale_optimization
         self.has_bias = True
 
-        # INT8 defaults to block-wise scaling, but allows tensor-wise and row-wise
-        if target_format == "int8" and scaling_mode not in ("tensor", "row", "block"):
-            scaling_mode = "block"
+        # INT8/INT4 format scaling mode defaults
+        if target_format in ("int8", "int4", "convrot_w4a4") and scaling_mode not in ("tensor", "row", "block"):
+            scaling_mode = "row" if target_format in ("int4", "convrot_w4a4") else "block"
         # Normalize block3d alias to block
         if scaling_mode == "block3d":
             scaling_mode = "block"
         self.scaling_mode = scaling_mode
 
         # Check ConvRot validity
-        if self.convrot and not (self.target_format == "int8" and self.scaling_mode == "row"):
-            verbose("  - WARNING: ConvRot is currently only supported for INT8 row-wise quantization. It will be ignored.")
+        if self.convrot and not (self.target_format in ("int8", "int4", "convrot_w4a4") and self.scaling_mode == "row"):
+            verbose("  - WARNING: ConvRot is currently supported for INT8 and INT4 row-wise quantization. It will be ignored.")
             self.convrot = False
             self.dynamic_convrot = False
 
         # Set format-specific max values and dtype
-        if self.target_format == "int8":
+        if self.target_format in ("int8", "int4", "convrot_w4a4"):
             self.target_dtype = TARGET_INT8_DTYPE
             self.f8_max_val = None
         else:
             self.target_dtype = TARGET_FP8_DTYPE
             self.f8_max_val = FP8_MAX
+
 
         verbose(f"LearnedRoundingConverter initialized on device: {self.device}")
         verbose(f"  - Target format: {self.target_format}")
@@ -720,8 +721,12 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
                         return quantized_tensor, dequant_scale, torch.zeros_like(W_float32), {}
 
-                    # INT8 quantization path
-                    if self.target_format == "int8":
+                    # Target format routing
+                    if self.target_format in ("int4", "convrot_w4a4"):
+                        qdata, scale, dequantized = self._convert_int4_convrot(
+                            W_float32, calibration_data=calibration_data
+                        )
+                    elif self.target_format == "int8":
                         if self.scaling_mode in ("tensor", "row"):
                             qdata, scale, dequantized = self._convert_int8_tensorwise(
                                 W_float32, calibration_data=calibration_data
@@ -730,6 +735,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                             qdata, scale, dequantized = self._convert_int8(W_float32)
                     else:
                         # FP8 quantization path - route based on scaling_mode
+
                         if self.scaling_mode == "row":
                             qdata, scale, dequantized = self._convert_fp8_rowwise(W_float32)
                         elif self.scaling_mode in ("block", "block2d"):
@@ -851,7 +857,344 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
         return (qdata, scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized_weight)
 
+    def _convert_int4_convrot(
+        self, W_float32: torch.Tensor, calibration_data: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        INT4 W4A4 ConvRot quantization conversion path.
+        Rotates weight using regular Hadamard matrix and quantizes per-row in 4-bit.
+        """
+        from ..utils.convrot import build_hadamard, pack_int4_row_major, rotate_weight, unpack_int4_row_major
+
+        convrot_applied = False
+        layer_group_size = self.convrot_group_size
+        M, N = W_float32.shape
+
+        if self.convrot and self.scaling_mode == "row":
+            if self.dynamic_convrot:
+                from ..utils.convrot import find_max_compatible_group_size
+                layer_group_size = find_max_compatible_group_size(N, min_group_size=self.convrot_group_size)
+
+            if layer_group_size is not None and N % layer_group_size == 0:
+                try:
+                    H = build_hadamard(layer_group_size, device=self.device, dtype=COMPUTE_DTYPE)
+                    W_float32 = rotate_weight(W_float32, H, layer_group_size)
+                    verbose(f"    - Applied ConvRot Hadamard rotation for INT4 (group_size={layer_group_size}).")
+                    convrot_applied = True
+                except Exception as e:
+                    verbose(f"    - WARNING: Failed to apply ConvRot for INT4: {e}")
+            else:
+                verbose(
+                    f"    - WARNING: Skipping ConvRot: in_features ({N}) not divisible by group_size ({layer_group_size})."
+                )
+
+        # Phase 2: Calibration Data Management
+        X_rot, Y_ref, H_mat = None, None, None
+        if self.convrot and self.scaling_mode == "row" and convrot_applied:
+            from ..utils.tensor_utils import prepare_calibration_data
+
+            X_rot, Y_ref, H_mat = prepare_calibration_data(
+                W_float32, calibration_data, True, layer_group_size, self.device, COMPUTE_DTYPE,
+                calib_scale=self.calib_scale
+            )
+            verbose("    - Executed Phase 2: Calibration Data Management for INT4")
+
+        row_max = W_float32.abs().amax(dim=1, keepdim=True).clamp_min(1e-10)
+        scale = (row_max / 7.0).squeeze(1)
+        scaled_int8 = (W_float32 / scale.unsqueeze(1)).round().clamp(-7, 7).to(torch.int8)
+        qdata = pack_int4_row_major(scaled_int8)
+
+        # Optional: Apply learned rounding optimization for INT4
+        if not self.no_learned_rounding and self.num_iter > 0:
+            verbose(f"    - Applying learned rounding optimization for INT4 ({self.scaling_mode}-wise)...")
+            if self.convrot and self.scaling_mode == "row" and X_rot is not None:
+                if self.scale_optimization == "dualround":
+                    verbose("    - Scale Optimization: DUALROUND for INT4 (Pass 1)")
+                    qdata, scale = self._optimize_int4_adaround(W_float32, qdata, scale, X_rot, Y_ref)
+
+                    # Scale Re-Estimation
+                    verbose("    - Scale Optimization: Re-estimating scales based on Pass 1 output...")
+                    dequant_opt = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE) * scale.unsqueeze(1)
+                    row_max_opt = dequant_opt.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+                    scale = (row_max_opt / 7.0).squeeze(1)
+                    scaled_int8 = (W_float32 / scale.unsqueeze(1)).round().clamp(-7, 7).to(torch.int8)
+                    qdata = pack_int4_row_major(scaled_int8)
+
+                    del dequant_opt, row_max_opt
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    verbose("    - Scale Optimization: DUALROUND for INT4 (Pass 2)")
+                    qdata, scale = self._optimize_int4_adaround(W_float32, qdata, scale, X_rot, Y_ref)
+                else:
+                    qdata, scale = self._optimize_int4_adaround(W_float32, qdata, scale, X_rot, Y_ref)
+
+        dequantized_rot = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE) * scale.unsqueeze(1)
+        if convrot_applied and layer_group_size is not None:
+            H = build_hadamard(layer_group_size, device=self.device, dtype=COMPUTE_DTYPE)
+            dequantized = rotate_weight(dequantized_rot, H, layer_group_size)
+        else:
+            dequantized = dequantized_rot
+
+        # Phase 4: Residual Bias Calibration
+        if self.has_bias and self.convrot and self.scaling_mode == "row" and X_rot is not None and Y_ref is not None:
+            with torch.no_grad():
+                Y_quant = X_rot @ dequantized_rot.T
+                bias_adj = (Y_ref - Y_quant).mean(dim=0)
+                self._current_extra_tensors["bias_correction"] = bias_adj.cpu()
+                verbose(
+                    f"    - Phase 4: Residual Bias Calibration for INT4 (bias correction norm: {bias_adj.norm().item():.6f})"
+                )
+
+        self._cleanup_tensors(W_float32)
+        if X_rot is not None or Y_ref is not None or H_mat is not None:
+            self._cleanup_tensors(X_rot, Y_ref, H_mat)
+
+        return qdata, scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized
+
+    def _optimize_int4_adaround(
+        self, W_float32: torch.Tensor, qdata: torch.Tensor, scale: torch.Tensor, X_rot: torch.Tensor, Y_ref: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply SVD-guided AdaRound (learned soft rounding) optimization over the rotated parameter space
+        minimizing local activation reconstruction MSE using the cached calibration data for INT4 W4A4.
+        """
+        from ..utils.convrot import pack_int4_row_major, unpack_int4_row_major
+        M, N = W_float32.shape
+
+        # 1. Compute SVD components of rotated parameter matrix
+        U_k, Vh_k, k = self._compute_svd_components(W_float32, verbose=True)
+
+        # 2. Setup soft rounding parameters V
+        scale_broadcast = scale.unsqueeze(1) if scale.dim() == 1 else scale
+        W_scaled = W_float32 / scale_broadcast.clamp_min(1e-12)
+        W_floor = W_scaled.floor().clamp(-7, 7)
+
+        # Target fraction for soft rounding
+        target = W_scaled - W_floor
+        target = torch.clamp(target, min=1e-6, max=1.0 - 1e-6)
+
+        # Temperature schedule for sigmoid (AdaRound paper: start soft, sharpen over time)
+        T_start, T_end = 20.0, 2.0
+        V_init = -torch.log((1.0 / target) - 1.0) * T_start
+        V = V_init.clone().detach().requires_grad_(True)
+
+        # 3. Setup optimizer
+        curr_lr = self.lr
+        if self.optimizer_choice == "adamw":
+            optimizer = AdamW([V], lr=curr_lr)
+        elif self.optimizer_choice == "radam":
+            optimizer = RAdam([V], lr=curr_lr)
+        elif self.optimizer_choice == "prodigy":
+            from prodigyplus.prodigy_plus_schedulefree import (
+                ProdigyPlusScheduleFree,
+            )
+
+            optimizer = ProdigyPlusScheduleFree([V], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed)
+        else:
+            optimizer = None  # Will use manual SGD on V
+
+        # 4. Compute initial metrics for dynamic self-tuning regularization
+        with torch.no_grad():
+            init_W_q_rounded = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE)
+            init_W_rounded_dequant = init_W_q_rounded * scale_broadcast
+            init_mse_rounded = torch.nn.functional.mse_loss(X_rot @ init_W_rounded_dequant.T, Y_ref)
+            init_svd_rounded = torch.linalg.norm(U_k.T @ (init_W_rounded_dequant - W_float32) @ Vh_k.T)
+
+        # Regularization balance factor: ~5% of initial rounded MSE loss
+        lambda_reg = 0.05 * max(init_mse_rounded.item(), 1e-5)
+
+        # SVD regularization balance factor: ~1% of initial rounded MSE loss
+        if init_svd_rounded.item() > 1e-8:
+            alpha_svd = 0.01 * (init_mse_rounded.item() / init_svd_rounded.item())
+        else:
+            alpha_svd = 0.0
+
+        schedule_name = self.lr_schedule
+        best_loss = float("inf")
+        best_V = V.detach().clone()
+        best_converged_ratio = 0.0
+        worse_loss_counter = 0
+        plateau_counter = 0
+        cooldown_counter = 0
+
+        # Only compute shape-aware plateau parameters if the plateau schedule is active
+        effective_patience, effective_factor, effective_cooldown = None, None, None
+        if schedule_name == "plateau":
+            effective_patience, effective_factor, effective_cooldown = self._compute_shape_aware_plateau_params(M, N)
+
+        # Dynamically derive early stop parameters from existing schedule config
+        decay_factor = self.lr_factor if self.lr_factor is not None else 0.95
+        if decay_factor >= 1.0:
+            decay_factor = 0.95
+
+        window_size = max(5, int(2.5 / (1.0 - decay_factor)))
+        loss_span_threshold = self.early_stop_loss / (1.0 - decay_factor)
+        target_converged_ratio = 0.90
+
+        loss_history = []
+        pbar = tqdm(
+            range(self.num_iter), desc=f"    Optimizing INT4 (AdaRound-{self.optimizer_choice}-{schedule_name})", leave=False,
+            dynamic_ncols=True
+        )
+        for i in pbar:
+            if optimizer is not None:
+                optimizer.zero_grad()
+
+            # Forward pass: Optimized soft rounding (smooth AdaRound)
+            temp = T_start + (T_end - T_start) * (i / self.num_iter)
+            h_V = torch.sigmoid(V / temp)
+            W_q = (W_floor + h_V).clamp(-7, 7)
+            W_dequant = W_q * scale_broadcast
+
+            # Track physical percentage of parameters converged to integer boundaries
+            converged_ratio = ((torch.sigmoid(V) < 0.05) | (torch.sigmoid(V) > 0.95)).float().mean().item()
+
+            # Loss 1: Output activation MSE
+            Y_pred = X_rot @ W_dequant.T
+            loss_mse = torch.nn.functional.mse_loss(Y_pred, Y_ref)
+
+            # Loss 2: SVD-guided weight-space projection error
+            weight_error = W_dequant - W_float32
+            projected_error = U_k.T @ weight_error @ Vh_k.T
+            loss_svd = torch.linalg.norm(projected_error)
+
+            # Loss 3: Soft rounding binary regularizer
+            loss_reg = (1.0 - (2.0 * h_V - 1.0).pow(2)).mean()
+
+            # Total Loss - Normalized
+            loss_mse_scaled = loss_mse / max(init_mse_rounded.item(), 1e-12)
+
+            if alpha_svd > 0 and init_svd_rounded.item() > 1e-8:
+                loss_svd_scaled = loss_svd / init_svd_rounded.item()
+            else:
+                loss_svd_scaled = 0.0
+
+            loss = loss_mse_scaled + 0.01 * loss_svd_scaled + 0.1 * loss_reg
+            scaled_loss = loss * 1e5
+
+            if optimizer is not None:
+                scaled_loss.backward()
+                if V.grad is not None:
+                    V.grad.div_(1e5)
+                optimizer.step()
+            else:
+                if V.grad is not None:
+                    V.grad.zero_()
+                scaled_loss.backward()
+                with torch.no_grad():
+                    V -= curr_lr * (V.grad / 1e5)
+
+            current_loss_val = loss.item()
+            prev_worse_counter = worse_loss_counter
+            improved = self._check_improvement(current_loss_val, best_loss)
+
+            loss_history.append(current_loss_val)
+            if len(loss_history) > window_size:
+                loss_history.pop(0)
+
+            if converged_ratio >= target_converged_ratio and len(loss_history) == window_size:
+                loss_span = max(loss_history) - min(loss_history)
+                if loss_span < loss_span_threshold:
+                    verbose(f"\n      - Discretization early stop: {converged_ratio*100:.2f}% parameters converged. Loss span: {loss_span:.2e} (< {loss_span_threshold:.2e}). Stopping.")
+                    break
+
+            if improved:
+                best_loss = current_loss_val
+                best_V = V.detach().clone()
+                best_converged_ratio = converged_ratio
+                plateau_counter = 0
+                if self.lr_adaptive_mode == "simple-reset":
+                    worse_loss_counter = 0
+            else:
+                worse_loss_counter += 1
+                plateau_counter += 1
+
+            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
+
+            if schedule_name == "exponential":
+                if not prodigy_warmup:
+                    curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
+                    if optimizer is not None:
+                        for param_group in optimizer.param_groups:
+                            param_group["lr"] = curr_lr
+            elif schedule_name == "plateau":
+                if prodigy_warmup:
+                    plateau_counter = 0
+                elif cooldown_counter > 0:
+                    cooldown_counter -= 1
+                    debug(f"      [LR] Cooldown: {cooldown_counter} left")
+                elif plateau_counter >= effective_patience:
+                    debug(f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying.")
+                    if curr_lr > self.lr_min:
+                        old_lr = curr_lr
+                        curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                        if optimizer is not None:
+                            for param_group in optimizer.param_groups:
+                                param_group["lr"] = curr_lr
+                        cooldown_counter = effective_cooldown
+                        debug(f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})")
+                    plateau_counter = 0
+                else:
+                    if plateau_counter > 0:
+                        debug(f"      [LR] Waiting: {plateau_counter}/{effective_patience} (Loss: {current_loss_val:.3e})")
+            else:  # "adaptive"
+                counter_for_update = prev_worse_counter if improved else worse_loss_counter
+                new_lr, lr_updated = self._adaptive_lr_update_cosine(
+                    curr_lr, improved, counter_for_update, i, (M, N), self.early_stop_lr
+                )
+                if lr_updated:
+                    curr_lr = new_lr
+                    if optimizer is not None:
+                        for param_group in optimizer.param_groups:
+                            param_group["lr"] = curr_lr
+                if improved and self.lr_adaptive_mode == "no-reset":
+                    worse_loss_counter = 0
+
+            if schedule_name == "plateau":
+                pbar.set_postfix(
+                    {
+                        "loss": f"{current_loss_val:.3e}",
+                        "best": f"{best_loss:.3e}",
+                        "lr": f"{curr_lr:.2e}",
+                        "plateau": f"{plateau_counter}/{effective_patience}"
+                    }
+                )
+            else:
+                pbar.set_postfix(
+                    {
+                        "loss": f"{current_loss_val:.3e}",
+                        "best": f"{best_loss:.3e}",
+                        "lr": f"{curr_lr:.2e}",
+                        "worse_count": f"{worse_loss_counter}"
+                    }
+                )
+
+            if best_loss <= self.early_stop_loss or curr_lr <= self.early_stop_lr or worse_loss_counter > self.early_stop_stall:
+                if curr_lr <= self.early_stop_lr:
+                    info("\n      - Learning rate bottomed out. Stopping early.")
+                elif worse_loss_counter > self.early_stop_stall:
+                    info("\n      - Loss has stalled. Stopping early.")
+                elif best_loss <= self.early_stop_loss:
+                    info("\n      - Loss is negligible. Stopping early.")
+                break
+
+        pbar.close()
+
+        with torch.no_grad():
+            best_V.sigmoid_().ge_(0.5)
+            W_floor.add_(best_V).clamp_(-7, 7)
+            opt_qdata = pack_int4_row_major(W_floor.to(torch.int8))
+            verbose(f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries.")
+
+        self._cleanup_tensors(U_k, Vh_k, V)
+        return opt_qdata, scale
+
+
+
     def _convert_int8_tensorwise(
+
         self, W_float32: torch.Tensor, calibration_data: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

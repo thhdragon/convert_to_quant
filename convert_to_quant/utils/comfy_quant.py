@@ -18,7 +18,8 @@ from .logging import error, info, minimal, verbose, warning
 from .tensor_utils import dict_to_tensor, normalize_tensorwise_scales, tensor_to_dict
 
 # Block-based formats that require group_size
-BLOCK_BASED_FORMATS = ("int8_blockwise", "float8_e4m3fn_blockwise")
+BLOCK_BASED_FORMATS = ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4")
+
 
 
 def create_comfy_quant_tensor(format_type: str, block_size: Optional[int] = None, full_precision_matrix_mult: Optional[bool] = None, convrot: Optional[bool] = None, convrot_groupsize: Optional[int] = None, per_row: Optional[bool] = None) -> torch.Tensor:

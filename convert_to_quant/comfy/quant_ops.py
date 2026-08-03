@@ -956,6 +956,51 @@ class TensorWiseINT8Layout(QuantizedLayout):
         return qtensor._qdata, qtensor._layout_params["scale"], qtensor._layout_params.get("is_weight", False)
 
 
+class TensorCoreConvRotW4A4Layout(QuantizedLayout):
+    """
+    ConvRot W4A4 Quantization Layout (group-wise Hadamard rotation + INT4).
+
+    Storage format:
+    - qdata: INT8 tensor containing packed signed INT4 nibbles [N, K // 2]
+    - scale: Per-row scaling factor (shape: [N] or [N, 1])
+    - convrot_groupsize: Group size for regular Hadamard rotation (default 256)
+    - quant_group_size: Quantization group size (default 64)
+    """
+
+    @classmethod
+    def quantize(cls, tensor, scale=None, convrot_groupsize=256, quant_group_size=64, **kwargs):
+        from .int4_kernels import quantize_convrot_w4a4_weight
+        orig_dtype = tensor.dtype
+        qdata, scales = quantize_convrot_w4a4_weight(tensor, convrot_groupsize=convrot_groupsize, quant_group_size=quant_group_size)
+        if scale is not None:
+            scales = scale
+        layout_params = {
+            "scale": scales.to(torch.float32),
+            "orig_dtype": orig_dtype,
+            "convrot_groupsize": convrot_groupsize,
+            "quant_group_size": quant_group_size,
+        }
+        return qdata, layout_params
+
+    @staticmethod
+    def dequantize(qdata, scale, orig_dtype=None, convrot_groupsize=256, quant_group_size=64, **kwargs):
+        from .int4_kernels import dequantize_convrot_w4a4_weight
+        if orig_dtype is None:
+            orig_dtype = torch.float16
+        return dequantize_convrot_w4a4_weight(
+            qdata,
+            scale,
+            convrot_groupsize=convrot_groupsize,
+            quant_group_size=quant_group_size,
+            output_dtype=orig_dtype,
+        )
+
+    @classmethod
+    def get_plain_tensors(cls, qtensor):
+        """Extract raw tensors for computation."""
+        return qtensor._qdata, qtensor._layout_params["scale"]
+
+
 # Note: group_size here is a fallback if per-tensor .comfy_quant metadata doesn't specify it.
 # Prefer always storing group_size in per-tensor metadata during conversion.
 QUANT_ALGOS = {
@@ -975,9 +1020,23 @@ QUANT_ALGOS = {
         "asymmetric_layout": True,
     },
     "int8_tensorwise": {"storage_t": torch.int8, "parameters": {"weight_scale", "input_scale"}, "comfy_tensor_layout": "TensorWiseINT8Layout"},
+    "convrot_w4a4": {
+        "storage_t": torch.int8,
+        "parameters": {"weight_scale"},
+        "comfy_tensor_layout": "TensorCoreConvRotW4A4Layout",
+        "group_size": 64,
+    },
 }
 
-LAYOUTS = {"TensorCoreFP8Layout": TensorCoreFP8Layout, "RowWiseFP8Layout": RowWiseFP8Layout, "BlockWiseFP8Layout": BlockWiseFP8Layout, "BlockWiseINT8Layout": BlockWiseINT8Layout, "TensorWiseINT8Layout": TensorWiseINT8Layout}
+LAYOUTS = {
+    "TensorCoreFP8Layout": TensorCoreFP8Layout,
+    "RowWiseFP8Layout": RowWiseFP8Layout,
+    "BlockWiseFP8Layout": BlockWiseFP8Layout,
+    "BlockWiseINT8Layout": BlockWiseINT8Layout,
+    "TensorWiseINT8Layout": TensorWiseINT8Layout,
+    "TensorCoreConvRotW4A4Layout": TensorCoreConvRotW4A4Layout,
+}
+
 
 
 @register_layout_op(torch.ops.aten.linear.default, "TensorCoreFP8Layout")
@@ -2031,5 +2090,89 @@ def tensorwise_int8_func(func, args, kwargs):
     return func(*args, **kwargs)
 
 # ==============================================================================
-# Block-Wise INT8 Layout + Operation Handlers
+# ConvRot W4A4 INT4 Layout + Operation Handlers
 # ==============================================================================
+
+
+@register_layout_op(torch.ops.aten.linear.default, "TensorCoreConvRotW4A4Layout")
+def convrot_w4a4_linear_handler(func, args, kwargs):
+    from .int4_kernels import convrot_w4a4_linear
+    input_tensor = args[0]
+    weight = args[1]
+    bias = args[2] if len(args) > 2 else None
+
+    if isinstance(weight, QuantizedTensor):
+        qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
+        convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
+        quant_group_size = weight._layout_params.get("quant_group_size", 64)
+        if isinstance(input_tensor, QuantizedTensor):
+            input_tensor = input_tensor.dequantize()
+        return convrot_w4a4_linear(
+            input_tensor,
+            qweight,
+            wscales,
+            bias=bias,
+            convrot_groupsize=convrot_groupsize,
+            quant_group_size=quant_group_size,
+        )
+    return func(*args, **kwargs)
+
+
+@register_layout_op(torch.ops.aten.mm.default, "TensorCoreConvRotW4A4Layout")
+def convrot_w4a4_mm_handler(func, args, kwargs):
+    from .int4_kernels import convrot_w4a4_linear
+    input_tensor = args[0]
+    weight = args[1]
+
+    if isinstance(weight, QuantizedTensor):
+        qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
+        convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
+        quant_group_size = weight._layout_params.get("quant_group_size", 64)
+        if isinstance(input_tensor, QuantizedTensor):
+            input_tensor = input_tensor.dequantize()
+        return convrot_w4a4_linear(
+            input_tensor,
+            qweight,
+            wscales,
+            bias=None,
+            convrot_groupsize=convrot_groupsize,
+            quant_group_size=quant_group_size,
+        )
+    return func(*args, **kwargs)
+
+
+@register_layout_op(torch.ops.aten.addmm.default, "TensorCoreConvRotW4A4Layout")
+def convrot_w4a4_addmm_handler(func, args, kwargs):
+    from .int4_kernels import convrot_w4a4_linear
+    bias = args[0]
+    input_tensor = args[1]
+    weight = args[2]
+
+    if isinstance(weight, QuantizedTensor):
+        qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
+        convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
+        quant_group_size = weight._layout_params.get("quant_group_size", 64)
+        if isinstance(input_tensor, QuantizedTensor):
+            input_tensor = input_tensor.dequantize()
+        return convrot_w4a4_linear(
+            input_tensor,
+            qweight,
+            wscales,
+            bias=bias,
+            convrot_groupsize=convrot_groupsize,
+            quant_group_size=quant_group_size,
+        )
+    return func(*args, **kwargs)
+
+
+@register_layout_op(torch.ops.aten.view.default, "TensorCoreConvRotW4A4Layout")
+@register_layout_op(torch.ops.aten.t.default, "TensorCoreConvRotW4A4Layout")
+def convrot_w4a4_func(func, args, kwargs):
+    input_tensor = args[0]
+    if isinstance(input_tensor, QuantizedTensor):
+        plain_input, scale = TensorCoreConvRotW4A4Layout.get_plain_tensors(input_tensor)
+        ar = list(args)
+        ar[0] = plain_input
+        return QuantizedTensor(func(*ar, **kwargs), "TensorCoreConvRotW4A4Layout", input_tensor._layout_params)
+    return func(*args, **kwargs)
+

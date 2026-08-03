@@ -8,11 +8,82 @@ Based on QuaRot (2024) and ConvRot (2025) approaches, adapted for DiT models
 with group-wise rotation to avoid row-wise outlier amplification.
 """
 
+# INT4 W4A4 ConvRot functions are included for full parity with INT8 ConvRot.
+
 import torch
 from scipy.linalg import hadamard as scipy_hadamard
 
 # Cache Hadamard matrices by (size, device, dtype) to avoid recomputation
 _HADAMARD_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+
+
+def pack_int4_row_major(x: torch.Tensor) -> torch.Tensor:
+    """Pack signed int4 values [-7, 7] into int8 bytes (2 values per byte)."""
+    low = x[..., 0::2].to(torch.uint8) & 0x0F
+    high = (x[..., 1::2].to(torch.uint8) & 0x0F) << 4
+    return (low | high).to(torch.int8)
+
+
+def unpack_int4_row_major(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack int8 bytes into signed int4 values stored in int8 [-7, 7]."""
+    u = packed.to(torch.uint8)
+    low = (u & 0x0F).to(torch.int8)
+    low = torch.where(low >= 8, low - 16, low)
+    high = ((u >> 4) & 0x0F).to(torch.int8)
+    high = torch.where(high >= 8, high - 16, high)
+
+    orig_shape = packed.shape
+    rows = orig_shape[:-1]
+    cols = orig_shape[-1] * 2
+    unpacked = torch.empty((*rows, cols), dtype=torch.int8, device=packed.device)
+    unpacked[..., 0::2] = low
+    unpacked[..., 1::2] = high
+    return unpacked
+
+
+def quantize_convrot_w4a4_weight(
+    weight: torch.Tensor,
+    convrot_groupsize: int = 256,
+    quant_group_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate weight offline with ConvRot Hadamard and quantize to packed signed INT4."""
+    try:
+        from comfy_kitchen.tensor.convrot_w4a4 import quantize_convrot_w4a4_weight as ck_quant
+        return ck_quant(weight, convrot_groupsize=convrot_groupsize, quant_group_size=quant_group_size)
+    except Exception:
+        pass
+
+    out_f, in_f = weight.shape
+    H = build_hadamard(convrot_groupsize, device=weight.device, dtype=weight.dtype)
+    weight_rot = rotate_weight(weight, H, convrot_groupsize)
+
+    # Per-row scale calculation for INT4 [-7, 7]
+    absmax = weight_rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    scales = absmax / 7.0
+    scaled = (weight_rot / scales).round().clamp(-7, 7).to(torch.int8)
+    qdata = pack_int4_row_major(scaled)
+    return qdata, scales.reshape(out_f).to(torch.float32)
+
+
+def dequantize_convrot_w4a4_weight(
+    qdata: torch.Tensor,
+    scales: torch.Tensor,
+    convrot_groupsize: int = 256,
+    quant_group_size: int = 64,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Dequantize packed INT4 weights and rotate back using inverse Hadamard."""
+    try:
+        from comfy_kitchen.tensor.convrot_w4a4 import dequantize_convrot_w4a4_weight as ck_dequant
+        return ck_dequant(qdata, scales, convrot_groupsize=convrot_groupsize, quant_group_size=quant_group_size, output_dtype=output_dtype)
+    except Exception:
+        pass
+
+    unpacked = unpack_int4_row_major(qdata).to(torch.float32)
+    w_rot = unpacked * scales.to(device=qdata.device, dtype=torch.float32).reshape(-1, 1)
+    H = build_hadamard(convrot_groupsize, device=qdata.device, dtype=torch.float32)
+    return rotate_weight(w_rot, H, convrot_groupsize).to(output_dtype)
+
 
 
 def build_hadamard(

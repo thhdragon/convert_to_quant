@@ -48,10 +48,11 @@ from .constants import (  # New registry
 )
 
 # Re-export converters
-from .converters import LearnedRoundingConverter
+from .converters import LearnedINT4Converter, LearnedRoundingConverter
 
 # Re-export formats
-from .formats import add_legacy_input_scale, cleanup_fp8_scaled, convert_fp8_scaled_to_comfy_quant, convert_int8_to_comfy_quant, convert_to_fp8_scaled
+from .formats import add_legacy_input_scale, cleanup_fp8_scaled, convert_fp8_scaled_to_comfy_quant, convert_int4_to_comfy_quant, convert_int8_to_comfy_quant, convert_to_fp8_scaled
+
 
 # Re-export utils
 from .utils import create_comfy_quant_tensor, dict_to_tensor, edit_comfy_quant, fix_comfy_quant_params_structure, normalize_tensorwise_scales, parse_add_keys_string, should_skip_layer_for_performance, tensor_to_dict
