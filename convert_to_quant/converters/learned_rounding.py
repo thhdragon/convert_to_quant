@@ -972,13 +972,15 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         W_floor = W_scaled.floor().clamp(-7, 7)
 
         # Target fraction for soft rounding
-        target = W_scaled - W_floor
-        target = torch.clamp(target, min=1e-6, max=1.0 - 1e-6)
+        target = (W_scaled - W_floor).clamp_(min=1e-6, max=1.0 - 1e-6)
 
         # Temperature schedule for sigmoid (AdaRound paper: start soft, sharpen over time)
         T_start, T_end = 20.0, 2.0
         V_init = -torch.log((1.0 / target) - 1.0) * T_start
         V = V_init.clone().detach().requires_grad_(True)
+        del W_scaled, target, V_init
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # 3. Setup optimizer
         curr_lr = self.lr
@@ -1001,6 +1003,9 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             init_W_rounded_dequant = init_W_q_rounded * scale_broadcast
             init_mse_rounded = torch.nn.functional.mse_loss(X_rot @ init_W_rounded_dequant.T, Y_ref)
             init_svd_rounded = torch.linalg.norm(U_k.T @ (init_W_rounded_dequant - W_float32) @ Vh_k.T)
+            del init_W_q_rounded, init_W_rounded_dequant
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Regularization balance factor: ~5% of initial rounded MSE loss
         lambda_reg = 0.05 * max(init_mse_rounded.item(), 1e-5)
@@ -1422,13 +1427,15 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         W_floor = W_scaled.floor()
 
         # Target fraction for soft rounding
-        target = W_scaled - W_floor
-        target = torch.clamp(target, min=1e-6, max=1.0 - 1e-6)
+        target = (W_scaled - W_floor).clamp_(min=1e-6, max=1.0 - 1e-6)
 
         # Temperature schedule for sigmoid (AdaRound paper: start soft, sharpen over time)
         T_start, T_end = 20.0, 2.0
         V_init = -torch.log((1.0 / target) - 1.0) * T_start
         V = V_init.clone().detach().requires_grad_(True)
+        del W_scaled, target, V_init
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # 3. Setup optimizer
         curr_lr = self.lr
@@ -1451,6 +1458,9 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             init_W_rounded_dequant = init_W_q_rounded * scale_broadcast
             init_mse_rounded = torch.nn.functional.mse_loss(X_rot @ init_W_rounded_dequant.T, Y_ref)
             init_svd_rounded = torch.linalg.norm(U_k.T @ (init_W_rounded_dequant - W_float32) @ Vh_k.T)
+            del init_W_q_rounded, init_W_rounded_dequant
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Regularization balance factor: ~5% of initial rounded MSE loss
         lambda_reg = 0.05 * max(init_mse_rounded.item(), 1e-5)
