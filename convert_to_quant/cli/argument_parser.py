@@ -17,7 +17,6 @@ EXPERIMENTAL_ARGS = {
     "int8",
     "int4",
     "nvfp4",
-
     "mxfp8",
     "make_hybrid_mxfp8",
     "tensor_scales_path",
@@ -91,6 +90,9 @@ MODES_ARGS = {
     "convert_int8_scaled",
     "make_hybrid_mxfp8",
     "tensor_scales_path",
+    # Model dequantization
+    "dequantize",
+    "dequant_dtype",
     # Legacy operations
     "legacy_input_add",
     "cleanup_fp8_scaled",
@@ -407,6 +409,17 @@ class MultiHelpArgumentParser(argparse.ArgumentParser):
         conversion_args = ["convert_fp8_scaled", "hp_filter", "full_precision_mm", "convert_int8_scaled"]
         for action in self._all_actions:
             if self._get_dest_name(action) in conversion_args:
+                line = self._format_action_help(action)
+                if line:
+                    print(line)
+
+        print()
+        print("Model Dequantization:")
+        print("-" * 40)
+
+        dequant_args = ["dequantize", "dequant_dtype"]
+        for action in self._all_actions:
+            if self._get_dest_name(action) in dequant_args:
                 line = self._format_action_help(action)
                 if line:
                     print(line)

@@ -180,7 +180,8 @@ def generate_config_template(input_file: str, output_path: str, block_size: int 
             all_keys = f.keys()
             weight_keys = [k for k in all_keys if k.endswith(".weight")]
     except Exception as e:
-        raise RuntimeError(f"Error reading model file: {e}")
+        msg = f"Error reading model file: {e}"
+        raise RuntimeError(msg)
 
     print(f"Found {len(weight_keys)} weight tensors")
 
