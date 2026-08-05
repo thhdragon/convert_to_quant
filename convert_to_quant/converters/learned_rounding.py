@@ -91,6 +91,8 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         self.has_bias = True
 
         # INT8/INT4 format scaling mode defaults
+        if self.convrot and target_format in ("int8", "int4", "convrot_w4a4") and scaling_mode == "tensor":
+            scaling_mode = "row"
         if target_format in ("int8", "int4", "convrot_w4a4") and scaling_mode not in ("tensor", "row", "block"):
             scaling_mode = "row" if target_format in ("int4", "convrot_w4a4") else "block"
         # Normalize block3d alias to block
@@ -879,13 +881,13 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 try:
                     H = build_hadamard(layer_group_size, device=self.device, dtype=COMPUTE_DTYPE)
                     W_float32 = rotate_weight(W_float32, H, layer_group_size)
-                    verbose(f"    - Applied ConvRot Hadamard rotation for INT4 (group_size={layer_group_size}).")
+                    info(f"    - Applied ConvRot Hadamard rotation for INT4 (group_size={layer_group_size}).")
                     convrot_applied = True
                 except Exception as e:
-                    verbose(f"    - WARNING: Failed to apply ConvRot for INT4: {e}")
+                    warning(f"    - Failed to apply ConvRot for INT4: {e}")
             else:
-                verbose(
-                    f"    - WARNING: Skipping ConvRot: in_features ({N}) not divisible by group_size ({layer_group_size})."
+                info(
+                    f"    - Skipping ConvRot: in_features ({N}) not compatible with static group_size ({layer_group_size})."
                 )
 
         # Phase 2: Calibration Data Management
@@ -897,7 +899,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 W_float32, calibration_data, True, layer_group_size, self.device, COMPUTE_DTYPE,
                 calib_scale=self.calib_scale
             )
-            verbose("    - Executed Phase 2: Calibration Data Management for INT4")
+            info("    - Executed Phase 2: Calibration Data Management for INT4")
 
         row_max = W_float32.abs().amax(dim=1, keepdim=True).clamp_min(1e-10)
         scale = (row_max / 7.0).squeeze(1)
@@ -906,14 +908,14 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
         # Optional: Apply learned rounding optimization for INT4
         if not self.no_learned_rounding and self.num_iter > 0:
-            verbose(f"    - Applying learned rounding optimization for INT4 ({self.scaling_mode}-wise)...")
+            info(f"    - Applying learned rounding optimization for INT4 ({self.scaling_mode}-wise)...")
             if self.convrot and self.scaling_mode == "row" and X_rot is not None:
                 if self.scale_optimization == "dualround":
-                    verbose("    - Scale Optimization: DUALROUND for INT4 (Pass 1)")
+                    info("    - Scale Optimization: DUALROUND for INT4 (Pass 1)")
                     qdata, scale = self._optimize_int4_adaround(W_float32, qdata, scale, X_rot, Y_ref)
 
                     # Scale Re-Estimation
-                    verbose("    - Scale Optimization: Re-estimating scales based on Pass 1 output...")
+                    info("    - Scale Optimization: Re-estimating scales based on Pass 1 output...")
                     dequant_opt = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE) * scale.unsqueeze(1)
                     row_max_opt = dequant_opt.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
                     scale = (row_max_opt / 7.0).squeeze(1)
@@ -925,7 +927,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                    verbose("    - Scale Optimization: DUALROUND for INT4 (Pass 2)")
+                    info("    - Scale Optimization: DUALROUND for INT4 (Pass 2)")
                     qdata, scale = self._optimize_int4_adaround(W_float32, qdata, scale, X_rot, Y_ref)
                 else:
                     qdata, scale = self._optimize_int4_adaround(W_float32, qdata, scale, X_rot, Y_ref)
@@ -943,7 +945,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 Y_quant = X_rot @ dequantized_rot.T
                 bias_adj = (Y_ref - Y_quant).mean(dim=0)
                 self._current_extra_tensors["bias_correction"] = bias_adj.cpu()
-                verbose(
+                info(
                     f"    - Phase 4: Residual Bias Calibration for INT4 (bias correction norm: {bias_adj.norm().item():.6f})"
                 )
 
@@ -1102,7 +1104,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             if converged_ratio >= target_converged_ratio and len(loss_history) == window_size:
                 loss_span = max(loss_history) - min(loss_history)
                 if loss_span < loss_span_threshold:
-                    verbose(f"\n      - Discretization early stop: {converged_ratio*100:.2f}% parameters converged. Loss span: {loss_span:.2e} (< {loss_span_threshold:.2e}). Stopping.")
+                    info(f"\n      - Discretization early stop: {converged_ratio*100:.2f}% parameters converged. Loss span: {loss_span:.2e} (< {loss_span_threshold:.2e}). Stopping.")
                     break
 
             if improved:
@@ -1186,12 +1188,13 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 break
 
         pbar.close()
+        info(f"    - Optimization finished at iter {i + 1}/{self.num_iter} (Best Loss: {best_loss:.4e}, Discretization: {best_converged_ratio * 100:.2f}% converged)")
 
         with torch.no_grad():
             best_V.sigmoid_().ge_(0.5)
             W_floor.add_(best_V).clamp_(-7, 7)
             opt_qdata = pack_int4_row_major(W_floor.to(torch.int8))
-            verbose(f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries.")
+            info(f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries.")
 
         self._cleanup_tensors(U_k, Vh_k, V)
         return opt_qdata, scale
@@ -1227,13 +1230,13 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 try:
                     H = build_hadamard(layer_group_size, device=self.device, dtype=COMPUTE_DTYPE)
                     W_float32 = rotate_weight(W_float32, H, layer_group_size)
-                    verbose(f"    - Applied ConvRot Hadamard rotation (group_size={layer_group_size}).")
+                    info(f"    - Applied ConvRot Hadamard rotation (group_size={layer_group_size}).")
                     convrot_applied = True
                 except Exception as e:
-                    verbose(f"    - WARNING: Failed to apply ConvRot: {e}")
+                    warning(f"    - Failed to apply ConvRot: {e}")
             else:
-                verbose(
-                    f"    - WARNING: Skipping ConvRot: in_features ({N}) not divisible by group_size ({layer_group_size})."
+                info(
+                    f"    - Skipping ConvRot: in_features ({N}) not compatible with static group_size ({layer_group_size})."
                 )
 
         # Phase 2: Calibration Data Management
@@ -1247,7 +1250,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 W_float32, calibration_data, True, layer_group_size, self.device, COMPUTE_DTYPE,
                 calib_scale=self.calib_scale
             )
-            verbose("    - Executed Phase 2: Calibration Data Management (Captured X, rotated X, computed reference Y)")
+            info("    - Executed Phase 2: Calibration Data Management (Captured X, rotated X, computed reference Y)")
 
         # Initial quantization
         # We need to manually handle tensor-wise vs row-wise if auto-quantizing
@@ -1265,16 +1268,16 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
         # Optional: Apply learned rounding optimization for INT8
         if not self.no_learned_rounding and self.num_iter > 0:
-            verbose(f"    - Applying learned rounding optimization for INT8 ({self.scaling_mode}-wise)...")
+            info(f"    - Applying learned rounding optimization for INT8 ({self.scaling_mode}-wise)...")
             if self.scaling_mode == "tensor":
                 qdata, scale = self._optimize_int8_tensorwise_learned_rounding(W_float32, qdata, scale)
             elif self.convrot and self.scaling_mode == "row" and X_rot is not None:
                 if self.scale_optimization == "dualround":
-                    verbose("    - Scale Optimization: DUALROUND (Pass 1)")
+                    info("    - Scale Optimization: DUALROUND (Pass 1)")
                     qdata, scale = self._optimize_int8_adaround(W_float32, qdata, scale, X_rot, Y_ref)
 
                     # Scale Re-Estimation
-                    verbose("    - Scale Optimization: Re-estimating scales based on Pass 1 output...")
+                    info("    - Scale Optimization: Re-estimating scales based on Pass 1 output...")
                     dequant_opt = TensorWiseINT8Layout.dequantize(qdata, scale, orig_dtype=COMPUTE_DTYPE)
                     row_max_opt = dequant_opt.abs().amax(dim=1, keepdim=True)
                     scale_opt = row_max_opt.clamp_min(1e-12) / 127.0
@@ -1287,7 +1290,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                    verbose("    - Scale Optimization: DUALROUND (Pass 2)")
+                    info("    - Scale Optimization: DUALROUND (Pass 2)")
                     qdata, scale = self._optimize_int8_adaround(W_float32, qdata, scale, X_rot, Y_ref)
                 else:
                     qdata, scale = self._optimize_int8_adaround(W_float32, qdata, scale, X_rot, Y_ref)
@@ -1303,7 +1306,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 Y_quant = X_rot @ dequantized_weight.T
                 bias_adj = (Y_ref - Y_quant).mean(dim=0)
                 self._current_extra_tensors["bias_correction"] = bias_adj.cpu()
-                verbose(
+                info(
                     f"    - Phase 4: Residual Bias Calibration (Computed mean delta of output activations, bias correction norm: {bias_adj.norm().item():.6f})"
                 )
 
@@ -1571,7 +1574,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             if converged_ratio >= target_converged_ratio and len(loss_history) == window_size:
                 loss_span = max(loss_history) - min(loss_history)
                 if loss_span < loss_span_threshold:
-                    verbose(f"\n      - Discretization early stop: {converged_ratio*100:.2f}% parameters converged. Loss span: {loss_span:.2e} (< {loss_span_threshold:.2e}). Stopping.")
+                    info(f"\n      - Discretization early stop: {converged_ratio*100:.2f}% parameters converged. Loss span: {loss_span:.2e} (< {loss_span_threshold:.2e}). Stopping.")
                     break
 
             if improved:
@@ -1660,6 +1663,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 break
 
         pbar.close()
+        info(f"    - Optimization finished at iter {i + 1}/{self.num_iter} (Best Loss: {best_loss:.4e}, Discretization: {best_converged_ratio * 100:.2f}% converged)")
 
         # Discretize V to get final quantized integers
         with torch.no_grad():
@@ -1668,7 +1672,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             del best_V
             final_qdata = self._finalize_int8_qdata(W_floor)
 
-            verbose(f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries.")
+            info(f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries.")
 
         self._cleanup_tensors(U_k, Vh_k, V)
         U_k = None

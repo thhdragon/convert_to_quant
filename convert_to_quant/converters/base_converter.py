@@ -19,6 +19,7 @@ from typing import (
 )
 
 import torch
+from ..utils.logging import debug, info, warning
 
 
 class BaseLearnedConverter(ABC):
@@ -273,21 +274,21 @@ class BaseLearnedConverter(ABC):
         k = min(k, max_rank)
 
         if verbose:
-            print(f"    - Tensor shape: [{M}, {N}], Max rank: {max_rank}. Using k={k} components.")
+            info(f"    - SVD components: shape [{M}, {N}], max rank {max_rank}, using k={k} components.")
 
         if self.full_matrix:
             if verbose:
-                print("    - Using torch.linalg.svd with full_matrices=True")
+                debug("    - Using torch.linalg.svd with full_matrices=True")
             U, _, Vh = torch.linalg.svd(W_float32, full_matrices=True, driver="gesvd")
         else:
             try:
                 if verbose:
-                    print("    - Trying svd_lowrank")
+                    debug("    - Trying svd_lowrank")
                 U, _, Vh = torch.svd_lowrank(W_float32, q=min(k + 10, max_rank), niter=4)
                 Vh = Vh.T
             except RuntimeError:
                 if verbose:
-                    print("    - svd_lowrank failed, falling back to full SVD.")
+                    info("    - svd_lowrank failed, falling back to full SVD.")
                 U, _, Vh = torch.linalg.svd(W_float32, full_matrices=False)
 
         return U[:, :k], Vh[:k, :], k

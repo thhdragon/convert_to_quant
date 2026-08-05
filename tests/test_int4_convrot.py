@@ -105,8 +105,8 @@ def test_convert_to_fp8_scaled_int4_comfy_quant(tmp_path):
     out_file = str(tmp_path / "model_int4.safetensors")
 
     weights = {
-        "layer1.weight": torch.randn(16, 256, dtype=torch.float32),
-        "layer1.bias": torch.randn(16, dtype=torch.float32),
+        "layer1.weight": torch.randn(256, 256, dtype=torch.float32),
+        "layer1.bias": torch.randn(256, dtype=torch.float32),
     }
     save_file(weights, in_file)
 

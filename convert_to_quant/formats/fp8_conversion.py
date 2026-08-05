@@ -468,7 +468,10 @@ def convert_to_fp8_scaled(
 
         convrot_applied = False
         convrot_group_size = 256
-        if is_int4 or (hasattr(converter, "convrot") and getattr(converter, "convrot") and getattr(converter, "scaling_mode", "") == "row"):
+        if is_int4 or (is_int8 and convrot) or (hasattr(converter, "convrot") and getattr(converter, "convrot") and getattr(converter, "scaling_mode", "") == "row"):
+            if any(dim < 256 for dim in original_tensor.shape) or any(dim % 256 != 0 for dim in original_tensor.shape):
+                info(f"  - Dimension ({list(original_tensor.shape)}) not compatible with convrot (requires each feature dim >= 256 and divisible by 256); copying layer untouched in bf16")
+                return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=torch.bfloat16)}}
             in_features = original_tensor.shape[1]
             dynamic_convrot = getattr(converter, "dynamic_convrot", False)
             if dynamic_convrot:

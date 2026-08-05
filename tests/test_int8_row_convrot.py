@@ -133,19 +133,18 @@ def test_triton_fused_kernel_compatibility(setup_data):
 def test_dynamic_convrot_resolution():
     from convert_to_quant.utils.convrot import find_max_compatible_group_size
 
-    assert find_max_compatible_group_size(4096, 256) == 4096
-    assert find_max_compatible_group_size(1024, 256) == 1024
-    assert find_max_compatible_group_size(1152, 256) is None  # Not divisible by any power of 4 >= 256
-    assert find_max_compatible_group_size(3072, 256) == 1024  # 3072 is divisible by 1024
-    assert find_max_compatible_group_size(512, 256) == 256    # 512 is divisible by 256
-    assert find_max_compatible_group_size(384, 256) is None   # 384 is divisible by 64 (which is < 256)
+    assert find_max_compatible_group_size(4096, 256) == 256
+    assert find_max_compatible_group_size(1024, 256) == 256
+    assert find_max_compatible_group_size(512, 256) == 256
+    assert find_max_compatible_group_size(128, 256) is None  # Dimension < 256
+    assert find_max_compatible_group_size(384, 256) is None  # Not divisible by 256
 
 
 def test_dynamic_convrot_pipeline():
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # W with in_features = 512 (divisible by 256, but not 1024)
+    # W with in_features = 512 (divisible by 256)
     W_orig = torch.randn(128, 512, device=device, dtype=torch.float32)
     X = torch.randn(64, 512, device=device, dtype=torch.float32)
 
@@ -153,7 +152,7 @@ def test_dynamic_convrot_pipeline():
         target_format="int8",
         scaling_mode="row",
         dynamic_convrot=True,
-        convrot_group_size=256,  # min group size
+        convrot_group_size=256,
         num_iter=10,
         device=device
     )
@@ -166,4 +165,70 @@ def test_dynamic_convrot_pipeline():
     assert qdata.shape == W_orig.shape
     assert qdata.dtype == torch.int8
     assert scale.shape == (128, 1)
+
+
+def test_convrot_dimension_less_than_256_bf16_copy(tmp_path):
+    from convert_to_quant.formats.fp8_conversion import convert_to_fp8_scaled
+    from safetensors.torch import save_file, safe_open
+
+    input_path = str(tmp_path / "model.safetensors")
+    output_path = str(tmp_path / "model_quant.safetensors")
+
+    # time_in.in_layer with shape [3072, 128] (one feature dimension 128 < 256) and large_layer with shape [512, 256]
+    tensors = {
+        "time_in.in_layer.weight": torch.randn(3072, 128, dtype=torch.float32),
+        "large_layer.weight": torch.randn(512, 256, dtype=torch.float32),
+    }
+    save_file(tensors, input_path)
+
+    convert_to_fp8_scaled(
+        input_file=input_path,
+        output_file=output_path,
+        comfy_quant=True,
+        filter_flags={},
+        calib_samples=1,
+        seed=42,
+        int8=True,
+        convrot=True,
+        convrot_group_size=256,
+        no_learned_rounding=True,
+    )
+
+    with safe_open(output_path, framework="pt") as f:
+        # time_in.in_layer weight should be copied untouched in bf16 and have no weight_scale
+        assert "time_in.in_layer.weight" in f.keys()
+        small_weight = f.get_tensor("time_in.in_layer.weight")
+        assert small_weight.dtype == torch.bfloat16
+        assert "time_in.in_layer.weight_scale" not in f.keys()
+
+        # large_layer weight should be quantized with weight_scale
+        assert "large_layer.weight" in f.keys()
+        assert "large_layer.weight_scale" in f.keys()
+
+    # Now test INT4 ConvRot format
+    output_path_int4 = str(tmp_path / "model_int4.safetensors")
+    convert_to_fp8_scaled(
+        input_file=input_path,
+        output_file=output_path_int4,
+        comfy_quant=True,
+        filter_flags={},
+        calib_samples=1,
+        seed=42,
+        primary_format="int4",
+        convrot=True,
+        convrot_group_size=256,
+        no_learned_rounding=True,
+    )
+
+    with safe_open(output_path_int4, framework="pt") as f:
+        assert "time_in.in_layer.weight" in f.keys()
+        small_weight = f.get_tensor("time_in.in_layer.weight")
+        assert small_weight.dtype == torch.bfloat16
+        assert "time_in.in_layer.weight_scale" not in f.keys()
+
+        assert "large_layer.weight" in f.keys()
+        assert "large_layer.weight_scale" in f.keys()
+
+
+
 

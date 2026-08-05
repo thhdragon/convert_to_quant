@@ -198,16 +198,9 @@ def rotate_activation(
 
 
 def find_max_compatible_group_size(in_features: int, min_group_size: int = 256) -> int | None:
-    """Find the largest power of 4 group size >= min_group_size that divides in_features."""
-    if in_features < min_group_size:
-        return None
-
-    import math
-    max_k = int(math.log(in_features, 4))
-    group_size = 4 ** max_k
-
-    while group_size >= min_group_size:
-        if in_features % group_size == 0:
-            return group_size
-        group_size //= 4
+    """Return static group size (default 256) if in_features >= min_group_size and divisible by group_size, else None."""
+    group_size = min_group_size
+    if in_features >= group_size and in_features % group_size == 0:
+        return group_size
     return None
+

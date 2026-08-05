@@ -273,14 +273,14 @@ def get_parser() -> MultiHelpArgumentParser:
         type=int,
         default=256,
         dest="convrot_group_size",
-        help="Group size for ConvRot (must be power of 4: 4, 16, 64, 256, 1024). Default: 256",
+        help="Group size for ConvRot. Default: 256. (Dimensions < 256 are copied untouched in bf16)",
     )
     parser.add_argument(
         "--dynamic-convrot",
         "--dynamic_convrot",
         action="store_true",
         dest="dynamic_convrot",
-        help="Enable dynamic group-wise Hadamard rotation (ConvRot) for INT8 row-wise scaling (minimum 256 group size) based on each layer's max compatible group size.",
+        help="Enable group-wise Hadamard rotation (ConvRot) with static group size 256 (dimensions < 256 copied untouched in bf16).",
     )
     parser.add_argument(
         "--nvfp4",
