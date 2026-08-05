@@ -11,8 +11,12 @@ Use --simple to switch to raw MXFP8Converter.
 import gc
 import os
 from typing import (
+    Any,
     Dict,
+    List,
     Optional,
+    Tuple,
+    Union,
 )
 
 import torch
@@ -98,8 +102,9 @@ def convert_to_mxfp8(
     lora_depth: int = -1,
     lora_ar_threshold: float = 0.0,
     lora_save_path: Optional[str] = None,
-    # Added for CLI compatibility
-    lora_output: Optional[str] = None,
+    # Device options
+    device: Optional[str] = None,
+    devices: Optional[Union[str, List[str]]] = None,
 ) -> None:
     """
     Convert safetensors model to MXFP8 (Microscaling FP8) quantized format.
@@ -115,7 +120,9 @@ def convert_to_mxfp8(
     info(f"Block size: {MXFP8_BLOCK_SIZE}")
     info("-" * 60)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    from ..utils.parallel_utils import parse_devices, run_parallel_layer_processing
+
+    target_devices = parse_devices(device=device, devices=devices)
     seed_device = "cpu"
     seed_generator = torch.Generator(device=seed_device)
     seed_generator.manual_seed(seed)
@@ -146,47 +153,44 @@ def convert_to_mxfp8(
             error(f"ERROR: Invalid regex pattern '{exclude_layers}': {e}")
             return
 
-    # Select converter based on --simple flag
-    if simple:
-        converter = MXFP8Converter(block_size=MXFP8_BLOCK_SIZE, pad_to_32x=True)
-        use_learned = False
-        info("MXFP8 Simple mode (no learned rounding optimization)")
-    else:
-        converter = LearnedMXFP8Converter(
-            optimizer=optimizer,
-            num_iter=num_iter,
-            top_p=top_p,
-            min_k=min_k,
-            max_k=max_k,
-            block_size=MXFP8_BLOCK_SIZE,
-            pad_to_32x=True,
-            full_matrix=full_matrix,
-            no_learned_rounding=False,
-            lr_schedule=lr_schedule,
-            lr_gamma=lr_gamma,
-            lr_patience=lr_patience,
-            lr_factor=lr_factor,
-            lr_min=lr_min,
-            lr_cooldown=lr_cooldown,
-            lr_threshold=lr_threshold,
-            lr_adaptive_mode=lr_adaptive_mode,
-            lr_shape_influence=lr_shape_influence,
-            lr_threshold_mode=lr_threshold_mode,
-            early_stop_loss=early_stop_loss,
-            early_stop_lr=early_stop_lr,
-            early_stop_stall=early_stop_stall,
-            scale_refinement_rounds=scale_refinement_rounds,
-            scale_optimization=scale_optimization,
-            lr=lr,
-            use_speed=use_speed,
-            # LoRA options
-            extract_lora=extract_lora,
-            lora_rank=lora_rank,
-            lora_target=lora_target,
-            lora_depth=lora_depth,
-            lora_ar_threshold=lora_ar_threshold,
-        )
-        use_learned = True
+    def create_converter_for_device(dev: str):
+        if simple:
+            return MXFP8Converter(block_size=MXFP8_BLOCK_SIZE, pad_to_32x=True)
+        else:
+            return LearnedMXFP8Converter(
+                optimizer=optimizer,
+                num_iter=num_iter,
+                top_p=top_p,
+                min_k=min_k,
+                max_k=max_k,
+                block_size=MXFP8_BLOCK_SIZE,
+                pad_to_32x=True,
+                full_matrix=full_matrix,
+                no_learned_rounding=False,
+                lr_schedule=lr_schedule,
+                lr_gamma=lr_gamma,
+                lr_patience=lr_patience,
+                lr_factor=lr_factor,
+                lr_min=lr_min,
+                lr_cooldown=lr_cooldown,
+                lr_threshold=lr_threshold,
+                lr_adaptive_mode=lr_adaptive_mode,
+                lr_shape_influence=lr_shape_influence,
+                lr_threshold_mode=lr_threshold_mode,
+                early_stop_loss=early_stop_loss,
+                early_stop_lr=early_stop_lr,
+                early_stop_stall=early_stop_stall,
+                scale_refinement_rounds=scale_refinement_rounds,
+                scale_optimization=scale_optimization,
+                lr=lr,
+                use_speed=use_speed,
+                extract_lora=extract_lora,
+                lora_rank=lora_rank,
+                lora_target=lora_target,
+                lora_depth=lora_depth,
+                lora_ar_threshold=lora_ar_threshold,
+                device=dev,
+            )
 
     output_tensors: Dict[str, torch.Tensor] = {}
     lora_tensors: Dict[str, torch.Tensor] = {}
@@ -210,8 +214,8 @@ def convert_to_mxfp8(
     weight_keys = sorted([k for k in all_keys if k.endswith(".weight") and loader.get_ndim(k) == 2])
     total_weights = len(weight_keys)
 
-    calibration_data_cache = {}
     # Generate calibration data for bias correction (always, even in simple mode)
+    calibration_data_cache = {}
     minimal("Scanning model and generating simulated calibration data...")
     for key in weight_keys:
         shape = loader.get_shape(key)
@@ -227,7 +231,10 @@ def convert_to_mxfp8(
     info(f"Found {total_weights} weight tensors to potentially process.")
     info("-" * 60)
 
-    for i, key in enumerate(weight_keys):
+    work_items = list(enumerate(weight_keys))
+
+    def process_layer_item(item: Tuple[int, str], dev: str) -> Dict[str, Any]:
+        i, key = item
         tensor = loader.get_tensor(key)
         base_key = key.rsplit(".weight", 1)[0]
         exclusion_reason = ""
@@ -242,28 +249,22 @@ def convert_to_mxfp8(
 
         # Skip non-2D tensors (MXFP8 requires 2D)
         if tensor.dim() != 2:
-            info(f"({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: non-2D tensor)")
-            output_tensors[key] = tensor
-            skipped_count += 1
-            continue
+            info(f"[{dev}] ({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: non-2D tensor)")
+            return {"key": key, "skipped": True, "tensors": {key: tensor.to("cpu")}}
 
         # Skip if exclusion pattern matched
         if exclusion_reason:
-            info(f"({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {exclusion_reason})")
-            output_tensors[key] = tensor
-            skipped_count += 1
-            continue
+            info(f"[{dev}] ({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {exclusion_reason})")
+            return {"key": key, "skipped": True, "tensors": {key: tensor.to("cpu")}}
 
         # Skip if heuristics say layer is poor for quantization
         if heur:
             should_skip, skip_reason = should_skip_layer_for_performance(tensor, MXFP8_BLOCK_SIZE)
             if should_skip:
-                info(f"({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {skip_reason})")
-                output_tensors[key] = tensor
-                skipped_count += 1
-                continue
+                info(f"[{dev}] ({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {skip_reason})")
+                return {"key": key, "skipped": True, "tensors": {key: tensor.to("cpu")}}
 
-        info(f"({i + 1}/{total_weights}) Processing tensor: {key}")
+        info(f"[{dev}] ({i + 1}/{total_weights}) Processing tensor: {key}")
 
         # Quantize to MXFP8
         # Extract block depth from key (look for .0. .1. etc patterns)
@@ -278,20 +279,14 @@ def convert_to_mxfp8(
         bias_key = f"{base_key}.bias"
         has_bias = bias_key in all_keys
 
-        # Quantize to MXFP8
-        if use_learned:
-            # LearnedMXFP8Converter returns (qdata, block_scales, dequantized, extra_tensors)
-            qdata, block_scales, dequant_w, extra_tensors = converter.convert(tensor, key=key, depth=depth, has_bias=has_bias)
-            # Crop dequant_w back to original shape if it was padded
-            if dequant_w is not None and dequant_w.shape != tensor.shape:
-                dequant_w = dequant_w[:tensor.shape[0], :tensor.shape[1]]
-        else:
+        converter_inst = create_converter_for_device(dev)
+        if simple:
             # Transfer to GPU for simple quantization
-            tensor_gpu = tensor.to(device=device, dtype=torch.float32)
-            qdata, block_scales = converter.quantize(tensor_gpu)
+            tensor_gpu = tensor.to(device=dev, dtype=torch.float32)
+            qdata, block_scales = converter_inst.quantize(tensor_gpu)
             if has_bias:
                 # For simple mode, we need to dequantize for bias correction
-                dequant_w = converter.dequantize(qdata, block_scales, output_dtype=torch.float32)
+                dequant_w = converter_inst.dequantize(qdata, block_scales, output_dtype=torch.float32)
                 # Crop dequant_w back to original shape if it was padded
                 if dequant_w.shape != tensor.shape:
                     dequant_w = dequant_w[:tensor.shape[0], :tensor.shape[1]]
@@ -299,6 +294,17 @@ def convert_to_mxfp8(
                 dequant_w = None
             del tensor_gpu
             extra_tensors = {}
+        else:
+            # LearnedMXFP8Converter returns (qdata, block_scales, dequantized, extra_tensors)
+            qdata, block_scales, dequant_w, extra_tensors = converter_inst.convert(
+                tensor, key=key, depth=depth, has_bias=has_bias
+            )
+            # Crop dequant_w back to original shape if it was padded
+            if dequant_w is not None and dequant_w.shape != tensor.shape:
+                dequant_w = dequant_w[:tensor.shape[0], :tensor.shape[1]]
+
+        res_tensors = {}
+        res_lora = {}
 
         # Store extracted LoRA tensors
         if extra_tensors:
@@ -306,16 +312,13 @@ def convert_to_mxfp8(
                 # lora_up -> base.lora_up.weight, lora_down -> base.lora_down.weight
                 # Add diffusion_model prefix for ComfyUI compatibility
                 full_lora_key = f"diffusion_model.{base_key}.{lora_key}.weight"
-                lora_tensors[full_lora_key] = lora_tensor.cpu()
+                res_lora[full_lora_key] = lora_tensor.cpu()
 
         # Store quantized data and scales (move to CPU for saving)
-        output_tensors[key] = qdata.cpu()  # FP8 E4M3
+        res_tensors[key] = qdata.cpu()  # FP8 E4M3
 
         # block_scales -> weight_scale (E8M0 stored as uint8, matching MXFP8 format)
-        # Note: MXFP8 has only one scale tensor (no weight_scale_2 like NVFP4)
-        # E8M0 is stored as uint8 since safetensors doesn't support float8_e8m0fnu
-        block_scales_uint8 = block_scales.view(torch.uint8) if block_scales.dtype != torch.uint8 else block_scales
-        output_tensors[f"{base_key}.weight_scale"] = block_scales_uint8.cpu()
+        res_tensors[f"{base_key}.weight_scale"] = block_scales.cpu()
 
         # Bias correction (matching FP8 logic)
         bias_key = f"{base_key}.bias"
@@ -327,46 +330,63 @@ def convert_to_mxfp8(
                 in_features = tensor.shape[1]
                 if in_features not in calibration_data_cache:
                     warning("  - WARNING: No calibration data for bias correction.")
-                    output_tensors[bias_key] = original_bias
+                    res_tensors[bias_key] = original_bias.to("cpu")
                 else:
-                    X_calib_dev = calibration_data_cache[in_features].to(device=device)
-                    W_orig_dev = tensor.to(device=device, dtype=COMPUTE_DTYPE)
-                    W_dequant_dev = dequant_w.to(device=device, dtype=COMPUTE_DTYPE)
-                    b_orig_dev = original_bias.to(device=device, dtype=COMPUTE_DTYPE)
+                    X_calib_dev = calibration_data_cache[in_features].to(device=dev)
+                    W_orig_dev = tensor.to(device=dev, dtype=COMPUTE_DTYPE)
+                    W_dequant_dev = dequant_w.to(device=dev, dtype=COMPUTE_DTYPE)
+                    b_orig_dev = original_bias.to(device=dev, dtype=COMPUTE_DTYPE)
                     weight_error = W_orig_dev - W_dequant_dev
                     output_error = X_calib_dev @ weight_error.T
                     bias_correction = output_error.mean(dim=0)
                     b_new = b_orig_dev - bias_correction
-                    output_tensors[bias_key] = b_new.to(device="cpu", dtype=original_bias.dtype)
-                    verbose(
-                        f"    - Original bias mean : {original_bias.mean().item():.6f}\n    - Corrected bias mean: {output_tensors[bias_key].mean().item():.6f}"
-                    )
+                    res_tensors[bias_key] = b_new.to(device="cpu", dtype=original_bias.dtype)
                     del (W_orig_dev, W_dequant_dev, X_calib_dev, b_orig_dev, weight_error, output_error, bias_correction, b_new)
-                    if device == "cuda":
+                    if str(dev).startswith("cuda"):
                         torch.cuda.empty_cache()
 
         # Always create .comfy_quant metadata tensor (required for MXFP8)
-        metadata = {
+        meta = {
             "format": "mxfp8",
             "group_size": MXFP8_BLOCK_SIZE,
             "orig_dtype": str(tensor.dtype),
-            "orig_shape": list(tensor.shape)
+            "orig_shape": list(tensor.shape),
         }
-        output_tensors[f"{base_key}.comfy_quant"] = dict_to_tensor(metadata)
-        quant_metadata[base_key] = metadata
+        res_tensors[f"{base_key}.comfy_quant"] = dict_to_tensor(meta)
 
         # Final shape outputs
         info(f"    - Final Weight shape      : {list(qdata.shape)}")
         info(f"    - Final Block Scale shape : {list(block_scales.shape)}")
         info("-" * 60)
 
-        quantized_count += 1
-
         # Cleanup
         del tensor, dequant_w
         gc.collect()
-        if device == "cuda":
+        if str(dev).startswith("cuda"):
             torch.cuda.empty_cache()
+
+        return {
+            "base_key": base_key,
+            "tensors": res_tensors,
+            "lora_tensors": res_lora,
+            "metadata": meta,
+            "skipped": False,
+        }
+
+    layer_results = run_parallel_layer_processing(work_items, process_layer_item, target_devices)
+
+    for r in layer_results:
+        if r.get("skipped"):
+            skipped_count += 1
+        else:
+            quantized_count += 1
+
+        if "tensors" in r:
+            output_tensors.update(r["tensors"])
+        if "lora_tensors" in r:
+            lora_tensors.update(r["lora_tensors"])
+        if "base_key" in r and "metadata" in r:
+            quant_metadata[r["base_key"]] = r["metadata"]
 
     # Copy non-weight tensors (bias handled above, copy others)
     for key in all_keys:

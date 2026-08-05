@@ -852,7 +852,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         # Clean up
         del W_float32
         gc.collect()
-        if self.device == "cuda":
+        if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
         return (qdata, scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized_weight)
@@ -1718,7 +1718,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             final_qdata = qdata_float.to(TARGET_INT8_DTYPE)
         del qdata_float
         gc.collect()
-        if self.device == "cuda":
+        if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
         return final_qdata
 
@@ -2260,7 +2260,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             del q_refined
         del qdata_float
         gc.collect()
-        if self.device == "cuda":
+        if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
         final_qdata = self._finalize_int8_qdata(final_tensor)
         return final_qdata
@@ -2313,7 +2313,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 dequantized_weight_tensor = W_f8.to(self.device, dtype=COMPUTE_DTYPE) / scale
             del W_float32, scale, compact_scale
             gc.collect()
-            if self.device == "cuda":
+            if str(self.device).startswith("cuda"):
                 torch.cuda.empty_cache()
             return W_f8, dequant_scale, dequantized_weight_tensor
 
@@ -2345,7 +2345,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             dequantized_weight_tensor = W_f8.to(self.device, dtype=COMPUTE_DTYPE) / scale
         del W_float32, scale, U_k, Vh_k, final_tensor_scaled, compact_scale
         gc.collect()
-        if self.device == "cuda":
+        if str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
         return (W_f8, dequant_scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized_weight_tensor)
@@ -2374,7 +2374,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             del W_float32
             gc.collect()
-            if self.device == "cuda":
+            if str(self.device).startswith("cuda"):
                 torch.cuda.empty_cache()
 
             return (W_f8, dequant_scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized)
@@ -2446,7 +2446,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             del W_float32, W_blocked
             gc.collect()
-            if self.device == "cuda":
+            if str(self.device).startswith("cuda"):
                 torch.cuda.empty_cache()
 
             return (W_f8, dequant_scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized)

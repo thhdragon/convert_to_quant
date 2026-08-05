@@ -26,6 +26,7 @@ from ..formats.mxfp8_conversion import convert_to_mxfp8
 from ..formats.nvfp4_conversion import convert_to_nvfp4
 from ..pinned_transfer import set_verbose as set_pinned_verbose
 from ..utils.comfy_quant import edit_comfy_quant
+from ..utils.parallel_utils import parse_devices
 from .argument_parser import (
     ADVANCED_ARGS,
     EXPERIMENTAL_ARGS,
@@ -426,7 +427,21 @@ def get_parser() -> MultiHelpArgumentParser:
         "--device",
         type=str,
         default=None,
-        help="Device to use for quantization (e.g., 'cpu', 'cuda'). Overrides auto-detection. Recommended with --simple for FP8/INT8.",
+        help="Device to use for quantization (e.g., 'cpu', 'cuda', 'cuda:0'). Overrides auto-detection. Recommended with --simple for FP8/INT8.",
+    )
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help="Comma- or space-separated list of devices for multi-GPU parallel layer quantization (e.g., 'cuda:0,cuda:1' or '0,1').",
+    )
+    parser.add_argument(
+        "--num_gpus",
+        "--num-gpus",
+        type=int,
+        default=None,
+        dest="num_gpus",
+        help="Number of GPUs to use for parallel layer quantization (e.g. 2 for cuda:0, cuda:1).",
     )
     parser.add_argument(
         "--input_scale",
@@ -1001,6 +1016,13 @@ def run_conversion(args):
     # Initialize logging framework with user's verbosity preference
     setup_logging(args.verbose)
 
+    # Parse target device list for single or multi-GPU execution
+    target_devices = parse_devices(
+        device=getattr(args, "device", None),
+        devices=getattr(args, "devices", None),
+        num_gpus=getattr(args, "num_gpus", None),
+    )
+
     # Set global scale normalization flag from CLI
     global NORMALIZE_SCALES_ENABLED
     NORMALIZE_SCALES_ENABLED = not args.no_normalize_scales
@@ -1195,6 +1217,7 @@ def run_conversion(args):
                 input_scales=input_scales,
                 # Memory mode
                 low_memory=args.low_memory,
+                devices=target_devices,
                 # Prodigy specific
                 use_speed=args.use_speed,
                 # LoRA options
@@ -1310,6 +1333,7 @@ def run_conversion(args):
                 scale_optimization=args.scale_optimization,
                 # Memory mode
                 low_memory=args.low_memory,
+                devices=target_devices,
                 # Prodigy specific
                 use_speed=args.use_speed,
                 # LoRA options
@@ -1600,6 +1624,7 @@ def run_conversion(args):
         save_quant_metadata=args.save_quant_metadata,
         low_memory=args.low_memory,
         device=args.device,
+        devices=target_devices,
         # Optimizer/LR options (passed to LearnedRoundingConverter)
         optimizer=args.optimizer,
         num_iter=args.num_iter,

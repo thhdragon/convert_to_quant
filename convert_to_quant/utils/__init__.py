@@ -4,6 +4,8 @@ from .comfy_quant import create_comfy_quant_tensor, edit_comfy_quant, fix_comfy_
 from .logging import debug, error, info, log_debug, minimal, setup_logging, verbose, warning
 from .tensor_utils import compute_bias_correction, dict_to_tensor, generate_calibration_data, normalize_tensorwise_scales, tensor_to_dict
 
+from .parallel_utils import parse_devices, run_parallel_layer_processing
+
 __all__ = [
     "dict_to_tensor",
     "tensor_to_dict",
@@ -23,4 +25,6 @@ __all__ = [
     "warning",
     "error",
     "log_debug",
+    "parse_devices",
+    "run_parallel_layer_processing",
 ]

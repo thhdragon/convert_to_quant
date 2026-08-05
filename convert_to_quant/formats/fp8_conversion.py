@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import tempfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from safetensors.torch import save_file
@@ -64,6 +64,7 @@ def convert_to_fp8_scaled(
     layer_config_fullmatch: bool = False,
     low_memory: bool = False,
     device: Optional[str] = None,
+    devices: Optional[Union[str, List[str]]] = None,
     # LoRA extraction options
     extract_lora: bool = False,
     lora_rank: int = 16,
@@ -77,6 +78,11 @@ def convert_to_fp8_scaled(
 ):
     # Ensure filter_flags is a dict
     filter_flags = filter_flags or {}
+
+    from ..utils.parallel_utils import parse_devices, run_parallel_layer_processing
+
+    target_devices = parse_devices(device=device, devices=devices)
+    device = target_devices[0]
 
     # Determine target format (priority: primary_format > int8 > fp8)
     if primary_format:
@@ -107,9 +113,6 @@ def convert_to_fp8_scaled(
     else:
         info(f"Target FP8 format: {TARGET_FP8_DTYPE}\nFP8 Range: [{FP8_MIN}, {FP8_MAX}]")
     info("-" * 60)
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Enforce CUDA for kernel-dependent formats if they are the PRIMARY target
     if target_format in ("mxfp8", "nvfp4") and device == "cpu":
@@ -176,7 +179,7 @@ def convert_to_fp8_scaled(
     block_size = converter_kwargs.get("block_size") or format_block_sizes.get(target_format, 64)
 
     # Helper function to create converter for a specific format type
-    def create_converter_for_format(fmt: str, overrides: dict = None, is_primary: bool = True):
+    def create_converter_for_format(fmt: str, overrides: dict = None, is_primary: bool = True, target_device: str = None):
         """Create appropriate converter instance for the given format.
 
         Args:
@@ -184,9 +187,12 @@ def convert_to_fp8_scaled(
             overrides: Parameter overrides for this specific converter
             is_primary: If True, inherit no_learned_rounding from global --simple.
                         If False (custom/fallback), only use override value.
+            target_device: Optional GPU/CPU device override for this converter instance.
         """
         kwargs = converter_kwargs.copy()
         kwargs["target_format"] = fmt
+        if target_device:
+            kwargs["device"] = target_device
 
         # Custom/fallback should NOT inherit global no_learned_rounding
         # They use their own --custom-simple / --fallback-simple flags
@@ -318,36 +324,31 @@ def convert_to_fp8_scaled(
     info(f"Found {total_weights} weight tensors to potentially process.")
     info("-" * 60)
 
-    for i, key in enumerate(weight_keys):
+    work_items = list(enumerate(weight_keys))
+
+    def process_layer_item(item: Tuple[int, str], dev: str) -> Dict[str, Any]:
+        i, key = item
         exclusion_reason = ""
         use_custom = False
         use_fallback = False
         use_layer_config = False
-        layer_format = target_format  # default to primary
-        layer_settings = None  # Per-layer settings from config
+        layer_format = target_format
+        layer_settings = None
 
-        # Pre-compute text encoder filter for input scale handling
         text_encoder_filter = filter_flags.get("t5xxl") or filter_flags.get("mistral") or filter_flags.get("visual") or filter_flags.get("generic_text")
 
-        # T5XXL decoder tensors are always removed (not quantized, not kept)
         if filter_flags.get("t5xxl") and any(n in key for n in T5XXL_REMOVE_KEY_NAMES):
-            info(f"({i + 1}/{total_weights}) Removing T5XXL decoder tensor: {key}")
-            skipped_count += 1
-            continue
+            info(f"[{dev}] ({i + 1}/{total_weights}) Removing T5XXL decoder tensor: {key}")
+            return {"key": key, "removed": True, "skipped": True}
 
-        # Check layer_config FIRST (highest priority)
         if layer_config:
             layer_settings = get_layer_settings(key, layer_config, fullmatch=layer_config_fullmatch)
             if layer_settings:
                 if layer_settings.get("skip", False):
-                    info(f"({i + 1}/{total_weights}) Skipping (layer-config): {key}")
+                    info(f"[{dev}] ({i + 1}/{total_weights}) Skipping (layer-config): {key}")
                     original_tensor = loader.get_tensor(key)
-                    new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
-                    loader.mark_processed(key)
-                    skipped_count += 1
-                    continue
+                    return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=original_tensor.dtype)}}
                 use_layer_config = True
-                # Map format to layer_format type
                 fmt = layer_settings["format"]
                 if fmt.startswith("float8"):
                     layer_format = "fp8"
@@ -360,72 +361,51 @@ def convert_to_fp8_scaled(
                 elif fmt in ("int4", "convrot_w4a4"):
                     layer_format = "convrot_w4a4"
                 else:
-                    layer_format = "fp8"  # fallback
+                    layer_format = "fp8"
 
-        # Check for custom pattern match (second priority, only if no layer_config match)
         if not use_layer_config and custom_pattern and custom_pattern.search(key):
             use_custom = True
             layer_format = custom_type
 
-        # Check --exclude-layers regex pattern (third priority, only if not custom/layer_config matched)
         if not use_custom and not use_layer_config and exclude_pattern and exclude_pattern.search(key):
             exclusion_reason = "regex exclusion (--exclude-layers)"
 
-        # Check exclusion filters (only matters if not custom matched and not layer_config matched)
-        # Uses MODEL_FILTERS registry for centralized filter definitions
         if not use_custom and not use_layer_config:
-            # Use filter_flags dict passed from CLI
             active_filters = filter_flags
-
-            # Check each active filter against the key
             for filter_name, is_active in active_filters.items():
                 if not is_active:
                     continue
                 cfg = MODEL_FILTERS[filter_name]
-
-                # Both "exclude" and "highprec" mean the same thing: skip quantization
                 skip_patterns = cfg.get("exclude", []) + cfg.get("highprec", [])
                 if skip_patterns and any(n in key for n in skip_patterns):
                     exclusion_reason = f"{filter_name} skip"
                     break
 
-        # Handle excluded layers: use fallback if available, otherwise skip
         if exclusion_reason and not use_custom and not use_layer_config:
             if fallback:
                 use_fallback = True
                 layer_format = fallback
-                info(f"({i + 1}/{total_weights}) Processing (fallback {fallback.upper()}): {key} (was: {exclusion_reason})")
+                info(f"[{dev}] ({i + 1}/{total_weights}) Processing (fallback {fallback.upper()}): {key} (was: {exclusion_reason})")
             else:
-                info(f"({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {exclusion_reason})")
+                info(f"[{dev}] ({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {exclusion_reason})")
                 original_tensor = loader.get_tensor(key)
-                new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
-                loader.mark_processed(key)
-                skipped_count += 1
-                continue
+                return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=original_tensor.dtype)}}
 
-        # Log what we're doing - User requested NORMAL (DEFAULT) be detailed per-tensor
         if use_layer_config:
             fmt = layer_settings["format"]
-            info(f"({i + 1}/{total_weights}) Processing (config {fmt}): {key}")
-            custom_count += 1  # Count layer_config as custom
+            info(f"[{dev}] ({i + 1}/{total_weights}) Processing (config {fmt}): {key}")
         elif use_custom:
-            info(f"({i + 1}/{total_weights}) Processing (custom {custom_type.upper()}): {key}")
-            custom_count += 1
+            info(f"[{dev}] ({i + 1}/{total_weights}) Processing (custom {custom_type.upper()}): {key}")
         elif use_fallback:
-            fallback_count += 1
+            info(f"[{dev}] ({i + 1}/{total_weights}) Processing (fallback {fallback.upper()}): {key}")
         else:
-            info(f"({i + 1}/{total_weights}) Processing ({format_name}): {key}")
+            info(f"[{dev}] ({i + 1}/{total_weights}) Processing ({format_name}): {key}")
 
-        processed_count += 1
         original_tensor = loader.get_tensor(key)
-
         if original_tensor.numel() == 0 or original_tensor.ndim != 2:
             info(f"  - Skipping empty or non-2D tensor: {key}")
-            new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
-            continue
+            return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=original_tensor.dtype)}}
 
-        # Check performance heuristics for inefficient layers
-        # Custom layers use custom_heur flag, others use global skip_inefficient_layers
         apply_heur = custom_heur if use_custom else skip_inefficient_layers
         if apply_heur:
             active_block_size = block_size
@@ -438,14 +418,9 @@ def convert_to_fp8_scaled(
             should_skip, skip_perf_reason = should_skip_layer_for_performance(original_tensor, active_block_size)
             if should_skip:
                 info(f"  - Skipping for performance: {skip_perf_reason}")
-                new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
-                loader.mark_processed(key)
-                skipped_count += 1
-                continue
+                return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=original_tensor.dtype)}}
 
-        # Select the appropriate converter based on layer format
         if use_layer_config:
-            # Create converter dynamically from layer_config settings
             cfg_overrides = {}
             cfg_block_size = layer_settings.get("block_size")
             cfg_scaling_mode = layer_settings.get("scaling_mode")
@@ -456,27 +431,24 @@ def convert_to_fp8_scaled(
                 cfg_overrides["scaling_mode"] = cfg_scaling_mode
             if cfg_simple:
                 cfg_overrides["no_learned_rounding"] = True
-            converter = create_converter_for_format(layer_format, cfg_overrides if cfg_overrides else None)
+            converter = create_converter_for_format(layer_format, cfg_overrides if cfg_overrides else None, target_device=dev)
         elif use_custom:
-            converter = converters["custom"]
+            converter = create_converter_for_format(custom_type, is_primary=False, target_device=dev)
         elif use_fallback:
-            converter = converters["fallback"]
+            converter = create_converter_for_format(fallback, is_primary=False, target_device=dev)
         else:
-            converter = converters["primary"]
+            converter = create_converter_for_format(target_format, is_primary=True, target_device=dev)
 
-        # Determine format type for this layer
         is_int8 = layer_format == "int8"
         is_mxfp8 = layer_format == "mxfp8"
         is_nvfp4 = layer_format == "nvfp4"
         is_int4 = layer_format in ("int4", "convrot_w4a4")
 
-        # Extract block depth from key (look for .0. .1. etc patterns)
         depth = -1
         depth_match = re.search(r"\.(\d+)\.", key)
         if depth_match:
             depth = int(depth_match.group(1))
 
-        # Check if convrot was effectively applied by this converter
         convrot_applied = False
         convrot_group_size = 256
         if is_int4 or (hasattr(converter, "convrot") and getattr(converter, "convrot") and getattr(converter, "scaling_mode", "") == "row"):
@@ -495,27 +467,23 @@ def convert_to_fp8_scaled(
                 if in_features % convrot_group_size == 0:
                     convrot_applied = True
 
-        # Check if the layer actually has a bias in the original model
         temp_base_name = key[: key.rfind(".weight")]
         has_bias = f"{temp_base_name}.bias" in all_keys
 
-        # Call converter and unpack based on format type
-        # Different converters have different return signatures
+        res_tensors = {}
+        res_lora = {}
+
         if is_mxfp8:
-            # MXFP8: (qdata_fp8, block_scales_e8m0, dequant_w, extra_tensors)
             q_tensor, block_scales, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, has_bias=has_bias)
-            dequant_s = block_scales  # For bias correction compatibility
+            dequant_s = block_scales
         elif is_nvfp4:
-            # NVFP4: (packed_qdata, block_scales_fp8, per_tensor_scale, dequant_w, extra_tensors)
             q_tensor, block_scales, per_tensor_scale, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, has_bias=has_bias)
-            dequant_s = block_scales  # For bias correction compatibility
+            dequant_s = block_scales
         else:
-            # FP8/INT8: (q_tensor, scale, dequant_w, extra_tensors)
             in_features = original_tensor.shape[1]
             cache_entry = calibration_data_cache.get(in_features)
             calib_data_loaded = False
             if isinstance(cache_entry, str):
-                # Load from disk cache
                 with MemoryEfficientSafeOpen(cache_entry, low_memory=True) as calib_loader:
                     calibration_data = calib_loader.get_tensor("calib_data")
                 calib_data_loaded = True
@@ -524,49 +492,40 @@ def convert_to_fp8_scaled(
 
             q_tensor, dequant_s, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, calibration_data=calibration_data, has_bias=has_bias)
 
-            # Cleanup calibration_data immediately if loaded from disk to prevent OOM
             if calib_data_loaded and calibration_data is not None:
                 del calibration_data
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        new_tensors[key] = q_tensor.to(device="cpu")
+        res_tensors[key] = q_tensor.to(device="cpu")
         base_name = key[: key.rfind(".weight")]
-
         bias_key = f"{base_name}.bias"
 
         if comfy_quant is True:
-            # Use the converter's block_size (respects custom/fallback overrides)
             layer_block_size = converter.block_size
-
-            # Determine full_precision_matrix_mult: per-layer config takes priority over global, then custom layers
             layer_full_precision_mm = full_precision_matrix_mult
             if use_layer_config and "full_precision_matrix_mult" in layer_settings:
                 layer_full_precision_mm = layer_settings["full_precision_matrix_mult"]
             elif use_custom and custom_full_precision_mm:
                 layer_full_precision_mm = True
 
-            # Variables for metadata collection
             comfy_quant_format = None
             block_size_for_meta = None
 
-            # Use appropriate scale key name and format based on quantization type
             if is_mxfp8:
-                # MXFP8 format - E8M0 block scales
-                new_tensors[f"{base_name}.weight_scale"] = block_scales.to(device="cpu")
+                res_tensors[f"{base_name}.weight_scale"] = block_scales.to(device="cpu")
                 comfy_quant_format = "mxfp8"
-                block_size_for_meta = 32  # MXFP8 fixed block size
+                block_size_for_meta = 32
                 comfy_quant_tensor = create_comfy_quant_tensor("mxfp8", block_size=32, full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None)
             elif is_nvfp4:
-                # NVFP4 format - dual scaling (block + per-tensor)
-                new_tensors[f"{base_name}.weight_scale"] = block_scales.to(device="cpu")
-                new_tensors[f"{base_name}.weight_scale_2"] = per_tensor_scale.to(device="cpu", dtype=torch.float32)
+                res_tensors[f"{base_name}.weight_scale"] = block_scales.to(device="cpu")
+                res_tensors[f"{base_name}.weight_scale_2"] = per_tensor_scale.to(device="cpu", dtype=torch.float32)
                 comfy_quant_format = "nvfp4"
-                block_size_for_meta = 16  # NVFP4 fixed block size
+                block_size_for_meta = 16
                 comfy_quant_tensor = create_comfy_quant_tensor("nvfp4", block_size=16, full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None)
             elif is_int4:
-                new_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
+                res_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
                 comfy_quant_format = "convrot_w4a4"
                 block_size_for_meta = layer_block_size
                 comfy_quant_tensor = create_comfy_quant_tensor(
@@ -577,45 +536,42 @@ def convert_to_fp8_scaled(
                     convrot_groupsize=convrot_group_size if convrot_applied else 256,
                 )
             elif is_int8:
-                new_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
-                if converter.scaling_mode in ("tensor", "row"):
+                res_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
+                per_row = False
+                if getattr(converter, "scaling_mode", "") in ("tensor", "row"):
                     comfy_quant_format = "int8_tensorwise"
                     block_size_for_meta = None
-                    if converter.scaling_mode == "row":
+                    if getattr(converter, "scaling_mode", "") == "row":
                         per_row = True
                 else:
                     comfy_quant_format = "int8_blockwise"
                     block_size_for_meta = layer_block_size
 
-                # Use correct INT8 format
                 comfy_quant_tensor = create_comfy_quant_tensor(
-                    comfy_quant_format, block_size=block_size_for_meta, full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None, convrot=convrot_applied, convrot_groupsize=convrot_group_size if convrot_applied else None, per_row=per_row if converter.scaling_mode == "row" else None
+                    comfy_quant_format,
+                    block_size=block_size_for_meta,
+                    full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None,
+                    convrot=convrot_applied,
+                    convrot_groupsize=convrot_group_size if convrot_applied else None,
+                    per_row=per_row if getattr(converter, "scaling_mode", "") == "row" else None,
                 )
-                # Add input_scale only for block-wise INT8 (dynamic quantization for rowwise doesn't use it)
                 if comfy_quant_format == "int8_blockwise":
-                    new_tensors[f"{base_name}.input_scale"] = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+                    res_tensors[f"{base_name}.input_scale"] = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             else:
-                # FP8 format - determine format based on scaling_mode or layer_config
-                new_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
-
-                # Select FP8 format type based on layer_config or scaling mode
+                res_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
                 if use_layer_config:
-                    # Use format directly from layer_config
                     fp8_format = layer_settings["format"]
                     fp8_block_size = layer_settings.get("block_size", layer_block_size)
-                elif converter.scaling_mode == "row":
+                elif getattr(converter, "scaling_mode", "") == "row":
                     fp8_format = "float8_e4m3fn_rowwise"
                     fp8_block_size = None
-                elif converter.scaling_mode in ("block", "block2d"):
-                    # 2D block-wise - 'block' is primary, 'block2d' is deprecated alias
+                elif getattr(converter, "scaling_mode", "") in ("block", "block2d"):
                     fp8_format = "float8_e4m3fn_blockwise"
                     fp8_block_size = layer_block_size
-                elif converter.scaling_mode == "block3d":
-                    # 3D per-row-group uses base format (not recommended)
+                elif getattr(converter, "scaling_mode", "") == "block3d":
                     fp8_format = "float8_e4m3fn"
                     fp8_block_size = None
                 else:
-                    # 'tensor' mode
                     fp8_format = "float8_e4m3fn"
                     fp8_block_size = None
 
@@ -623,17 +579,16 @@ def convert_to_fp8_scaled(
                 block_size_for_meta = fp8_block_size
 
                 comfy_quant_tensor = create_comfy_quant_tensor(fp8_format, block_size=fp8_block_size, full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None)
-                # Add input_scale for FP8: use weight_scale for t5xxl/mistral/visual, 1.0 otherwise
                 if include_input_scale or text_encoder_filter:
                     if text_encoder_filter:
-                        new_tensors[f"{base_name}.input_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
+                        res_tensors[f"{base_name}.input_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
                     else:
-                        new_tensors[f"{base_name}.input_scale"] = torch.tensor(1.0, dtype=torch.float32, device="cpu")
-            new_tensors[f"{base_name}.comfy_quant"] = comfy_quant_tensor.to(device="cpu")
+                        res_tensors[f"{base_name}.input_scale"] = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-            # Collect metadata if enabled
-            if save_quant_metadata:
-                # Reconstruct the dict that was used to create the tensor
+            res_tensors[f"{base_name}.comfy_quant"] = comfy_quant_tensor.to(device="cpu")
+
+            meta_entry = None
+            if quant_metadata_layers is not None:
                 meta_entry = {"format": comfy_quant_format}
                 block_based_formats = {"int8_blockwise", "float8_e4m3fn_blockwise", "mxfp8", "nvfp4", "convrot_w4a4"}
                 if block_size_for_meta is not None and comfy_quant_format in block_based_formats:
@@ -644,23 +599,15 @@ def convert_to_fp8_scaled(
                     meta_entry["convrot"] = True
                     meta_entry["convrot_groupsize"] = convrot_group_size if convrot_applied else 256
 
-                quant_metadata_layers[base_name] = meta_entry
-
         else:
-            # Non-comfy (legacy) path - FP8/INT8 only
-            new_tensors[f"{base_name}.scale_weight"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
-            # Add scale_input for non-comfy mode: use dequant_s for t5xxl/mistral, ones for others
+            res_tensors[f"{base_name}.scale_weight"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
             if include_input_scale or text_encoder_filter:
                 if text_encoder_filter:
-                    new_tensors[f"{base_name}.scale_input"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
+                    res_tensors[f"{base_name}.scale_input"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
                 else:
-                    # Shape matches scale_weight, filled with 1.0
-                    new_tensors[f"{base_name}.scale_input"] = torch.ones_like(dequant_s, dtype=SCALE_DTYPE, device="cpu")
+                    res_tensors[f"{base_name}.scale_input"] = torch.ones_like(dequant_s, dtype=SCALE_DTYPE, device="cpu")
+            meta_entry = None
 
-        # Determine if this layer uses simple mode (skip bias correction to save memory)
-        layer_uses_simple = custom_simple if use_custom else (fallback_simple if use_fallback else no_learned_rounding)
-
-        # Check if we should adjust bias for ConvRot/Bias Correction
         if "bias_correction" in extra_tensors:
             if bias_key in all_keys:
                 with torch.no_grad():
@@ -668,11 +615,8 @@ def convert_to_fp8_scaled(
                     info(f"  - Adjusting corresponding bias using ConvRot-specific calibration: {bias_key}")
                     original_bias = loader.get_tensor(bias_key)
                     b_new = (original_bias.to(dtype=COMPUTE_DTYPE) + bias_correction.to(dtype=COMPUTE_DTYPE)).to(dtype=original_bias.dtype)
-                    new_tensors[bias_key] = b_new
-                    print(f"    - Original bias mean : {original_bias.mean().item():.6f}\n    - Corrected bias mean: {new_tensors[bias_key].mean().item():.6f}")
+                    res_tensors[bias_key] = b_new
         elif bias_key in all_keys:
-            # Apply bias correction even in simple mode for better accuracy
-            # Only if we have dequantized weights to calculate error from
             if dequant_w is not None:
                 info(f"  - Adjusting corresponding bias: {bias_key}")
                 with torch.no_grad():
@@ -680,15 +624,13 @@ def convert_to_fp8_scaled(
                     in_features = original_tensor.shape[1]
                     if in_features not in calibration_data_cache:
                         warning(f"  - WARNING: No calibration data for bias correction of {bias_key}.")
-                        new_tensors[bias_key] = original_bias
+                        res_tensors[bias_key] = original_bias.to("cpu")
                     else:
                         cache_entry = calibration_data_cache[in_features]
                         if isinstance(cache_entry, str):
-                            # Disk cache: load using MemoryEfficientSafeOpen
                             with MemoryEfficientSafeOpen(cache_entry, low_memory=True) as calib_loader:
                                 calib_data = calib_loader.get_tensor("calib_data")
                         else:
-                            # CPU cache
                             calib_data = cache_entry
 
                         total_samples = calib_data.shape[0]
@@ -699,18 +641,17 @@ def convert_to_fp8_scaled(
 
                         while True:
                             try:
-                                X_calib_dev = calib_data[:current_samples].to(device=device)
-                                W_orig_dev = original_tensor.to(device=device, dtype=COMPUTE_DTYPE)
-                                W_dequant_dev = dequant_w.to(device=device, dtype=COMPUTE_DTYPE)
-                                b_orig_dev = original_bias.to(device=device, dtype=COMPUTE_DTYPE)
+                                X_calib_dev = calib_data[:current_samples].to(device=dev)
+                                W_orig_dev = original_tensor.to(device=dev, dtype=COMPUTE_DTYPE)
+                                W_dequant_dev = dequant_w.to(device=dev, dtype=COMPUTE_DTYPE)
+                                b_orig_dev = original_bias.to(device=dev, dtype=COMPUTE_DTYPE)
                                 weight_error = W_orig_dev - W_dequant_dev
                                 output_error = X_calib_dev @ weight_error.T
                                 bias_correction = output_error.mean(dim=0)
                                 b_new = b_orig_dev - bias_correction
-                                new_tensors[bias_key] = b_new.to(device="cpu", dtype=original_bias.dtype)
-                                print(f"    - Original bias mean : {original_bias.mean().item():.6f}\n    - Corrected bias mean: {new_tensors[bias_key].mean().item():.6f}")
+                                res_tensors[bias_key] = b_new.to(device="cpu", dtype=original_bias.dtype)
                                 del (W_orig_dev, W_dequant_dev, X_calib_dev, b_orig_dev, weight_error, output_error, bias_correction, b_new)
-                                if device == "cuda":
+                                if str(dev).startswith("cuda"):
                                     torch.cuda.empty_cache()
                                 break
                             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -725,7 +666,7 @@ def convert_to_fp8_scaled(
                                         except KeyError:
                                             pass
                                 gc.collect()
-                                if device == "cuda":
+                                if str(dev).startswith("cuda"):
                                     torch.cuda.empty_cache()
 
                                 retry_count += 1
@@ -734,44 +675,55 @@ def convert_to_fp8_scaled(
                                     raise
 
                                 current_samples = max(min_samples, int(current_samples * 0.7))
-                                warning(f"  - WARNING: OOM during bias correction. Retrying with {current_samples} samples (attempt {retry_count}).")
 
                         if isinstance(cache_entry, str):
                             del calib_data
                             gc.collect()
             else:
-                # No dequant_w available (shouldn't happen with learned rounding)
-                new_tensors[bias_key] = loader.get_tensor(bias_key)
+                res_tensors[bias_key] = loader.get_tensor(bias_key).to("cpu")
 
-        # T5XXL/Mistral fallback: ensure input scale exists with correct key format
         if text_encoder_filter:
-            if comfy_quant and f"{base_name}.input_scale" not in new_tensors:
-                new_tensors[f"{base_name}.input_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
-            elif not comfy_quant and f"{base_name}.scale_input" not in new_tensors:
-                new_tensors[f"{base_name}.scale_input"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
+            if comfy_quant and f"{base_name}.input_scale" not in res_tensors:
+                res_tensors[f"{base_name}.input_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
+            elif not comfy_quant and f"{base_name}.scale_input" not in res_tensors:
+                res_tensors[f"{base_name}.scale_input"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
 
-        # Get scale key name based on comfy_quant mode
-        scale_key = f"{base_name}.weight_scale" if comfy_quant else f"{base_name}.scale_weight"
-        if scale_key in new_tensors:
-            new_scale = new_tensors[scale_key]
-            if dequant_s.ndim == 1:
-                info(f"    - Final Dequant Scale value: {new_scale}\n    - Final Weight shape       : {q_tensor.shape}")
-            else:
-                info(f"    - Final Dequant Scale shape: {new_scale.shape}\n    - Final Weight shape       : {q_tensor.shape}")
         info("-" * 60)
 
-        # Immediate VRAM reclamation for low_memory mode
-        q_tensor = None
-        dequant_s = None
-        dequant_w = None
-        extra_tensors = None
-        original_tensor = None
-        comfy_quant_tensor = None
-        bias_correction = None
-        if low_memory:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        del original_tensor, q_tensor, dequant_s, dequant_w
+        gc.collect()
+        if str(dev).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        return {
+            "base_name": base_name,
+            "tensors": res_tensors,
+            "lora_tensors": res_lora,
+            "meta_entry": meta_entry,
+            "skipped": False,
+            "use_custom": use_custom,
+            "use_fallback": use_fallback,
+            "use_layer_config": use_layer_config,
+        }
+
+    layer_results = run_parallel_layer_processing(work_items, process_layer_item, target_devices)
+
+    for r in layer_results:
+        if r.get("skipped"):
+            skipped_count += 1
+        else:
+            processed_count += 1
+            if r.get("use_custom") or r.get("use_layer_config"):
+                custom_count += 1
+            elif r.get("use_fallback"):
+                fallback_count += 1
+
+        if "tensors" in r:
+            new_tensors.update(r["tensors"])
+        if "lora_tensors" in r:
+            lora_tensors.update(r["lora_tensors"])
+        if "base_name" in r and r.get("meta_entry") and quant_metadata_layers is not None:
+            quant_metadata_layers[r["base_name"]] = r["meta_entry"]
 
     # Copy remaining tensors (bias, norms, etc.)
     for key in all_keys:
