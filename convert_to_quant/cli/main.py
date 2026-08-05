@@ -1388,17 +1388,24 @@ def run_conversion(args):
     # Handle activation scale calibration mode (separate workflow)
     if args.actcal:
         try:
-            from .calibrate_activation_scales import (
+            from ..calibrate_activation_scales import (
                 calibrate_model,
                 load_lora_tensors,
                 patch_model_with_scales,
             )
         except ImportError:
-            from calibrate_activation_scales import (
-                calibrate_model,
-                load_lora_tensors,
-                patch_model_with_scales,
-            )
+            try:
+                from convert_to_quant.calibrate_activation_scales import (
+                    calibrate_model,
+                    load_lora_tensors,
+                    patch_model_with_scales,
+                )
+            except ImportError:
+                from calibrate_activation_scales import (
+                    calibrate_model,
+                    load_lora_tensors,
+                    patch_model_with_scales,
+                )
 
         if not args.output:
             base = os.path.splitext(args.input)[0]
