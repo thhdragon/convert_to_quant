@@ -395,24 +395,21 @@ def calibrate_model(tensors: dict, calib_samples: int = 64, seed: int = 42, perc
     # Find all weight layers
     weight_keys = [k for k in tensors.keys() if k.endswith(".weight")]
 
-    # Build list of base names for FP8 layers
-    fp8_base_names = []
+    # Build list of base names for candidate linear layers
+    candidate_base_names = []
     for key in weight_keys:
         weight = tensors[key]
         if weight.ndim != 2:
             continue
         base_name = key[:-7]  # Remove ".weight"
-        is_fp8_weight = weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        has_weight_scale = f"{base_name}.weight_scale" in tensors or f"{base_name}.scale_weight" in tensors
-        if is_fp8_weight or has_weight_scale:
-            fp8_base_names.append(base_name)
+        candidate_base_names.append(base_name)
 
     # Build LoRA key map if LoRA tensors are provided
     lora_key_map = {}
     if lora_tensors:
-        lora_key_map = build_lora_key_map(fp8_base_names, lora_tensors)
+        lora_key_map = build_lora_key_map(candidate_base_names, lora_tensors)
         if verbose:
-            print(f"  LoRA key map: matched {len(lora_key_map)} of {len(fp8_base_names)} layers")
+            print(f"  LoRA key map: matched {len(lora_key_map)} of {len(candidate_base_names)} layers")
 
     for key in weight_keys:
         weight = tensors[key]
@@ -423,13 +420,6 @@ def calibrate_model(tensors: dict, calib_samples: int = 64, seed: int = 42, perc
 
         out_features, in_features = weight.shape
         base_name = key[:-7]  # Remove ".weight"
-
-        # Check if this layer has FP8 weights or weight_scale (indicating quantization)
-        is_fp8_weight = weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        has_weight_scale = f"{base_name}.weight_scale" in tensors or f"{base_name}.scale_weight" in tensors
-
-        if not (is_fp8_weight or has_weight_scale):
-            continue
 
         # Check if we have LoRA for this layer (using the key map)
         lora_A = None

@@ -74,6 +74,7 @@ def convert_to_fp8_scaled(
     lora_save_path: Optional[str] = None,
     # Added for CLI compatibility
     lora_output: Optional[str] = None,
+    input_scales: Optional[Dict[str, Any]] = None,
     **converter_kwargs,
 ):
     # Ensure filter_flags is a dict
@@ -579,7 +580,12 @@ def convert_to_fp8_scaled(
                 block_size_for_meta = fp8_block_size
 
                 comfy_quant_tensor = create_comfy_quant_tensor(fp8_format, block_size=fp8_block_size, full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None)
-                if include_input_scale or text_encoder_filter:
+                if input_scales and base_name in input_scales:
+                    val = input_scales[base_name]
+                    if isinstance(val, torch.Tensor):
+                        val = val.item() if val.numel() == 1 else val
+                    res_tensors[f"{base_name}.input_scale"] = torch.tensor(val, dtype=torch.float32, device="cpu")
+                elif include_input_scale or text_encoder_filter:
                     if text_encoder_filter:
                         res_tensors[f"{base_name}.input_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
                     else:
@@ -601,7 +607,12 @@ def convert_to_fp8_scaled(
 
         else:
             res_tensors[f"{base_name}.scale_weight"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
-            if include_input_scale or text_encoder_filter:
+            if input_scales and base_name in input_scales:
+                val = input_scales[base_name]
+                if isinstance(val, torch.Tensor):
+                    val = val.item() if val.numel() == 1 else val
+                res_tensors[f"{base_name}.scale_input"] = torch.tensor(val, dtype=SCALE_DTYPE, device="cpu")
+            elif include_input_scale or text_encoder_filter:
                 if text_encoder_filter:
                     res_tensors[f"{base_name}.scale_input"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
                 else:
@@ -745,7 +756,7 @@ def convert_to_fp8_scaled(
     # Use empty((0)) when input_scale is present (t5xxl, mistral, or --input_scale flag)
     if not comfy_quant and not int8 and not custom_layers and "scaled_fp8" not in new_tensors:
         has_text_encoder_filter = filter_flags.get("t5xxl") or filter_flags.get("mistral") or filter_flags.get("visual")
-        new_tensors["scaled_fp8"] = torch.empty((0), dtype=TARGET_FP8_DTYPE) if (has_text_encoder_filter or include_input_scale) else torch.empty((2), dtype=TARGET_FP8_DTYPE)
+        new_tensors["scaled_fp8"] = torch.empty((0), dtype=TARGET_FP8_DTYPE) if (has_text_encoder_filter or include_input_scale or bool(input_scales)) else torch.empty((2), dtype=TARGET_FP8_DTYPE)
 
     info(f"Saving {len(new_tensors)} tensors to {output_file}")
     try:

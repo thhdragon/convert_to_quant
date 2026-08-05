@@ -40,7 +40,7 @@ class TestMultiGPUUtils(unittest.TestCase):
 
     def test_cli_parser_multi_gpu_args(self):
         parser = get_parser()
-        args = parser.parse_args(["input.safetensors", "--devices", "cuda:0,cuda:1", "--num-gpus", "2"])
+        args = parser.parse_args(["-i", "input.safetensors", "--devices", "cuda:0,cuda:1", "--num-gpus", "2"])
         self.assertEqual(args.devices, "cuda:0,cuda:1")
         self.assertEqual(args.num_gpus, 2)
 

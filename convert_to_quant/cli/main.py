@@ -1030,6 +1030,8 @@ def run_conversion(args):
     # Set pinned memory verbosity
     set_pinned_verbose(args.verbose_pinned)
 
+    actcal_scales = None
+
     # Dry-run modes are separate workflows and must return before any conversion.
     if args.dry_run == "analyze":
         analyze_dry_run(args)
@@ -1166,7 +1168,7 @@ def run_conversion(args):
             # Extract filter flags with validation
             filter_flags = extract_filter_flags(args)
 
-            # Load input scales if provided
+            # Load input scales if provided or calibrated
             input_scales = None
             if args.input_scales_path:
                 if not os.path.exists(args.input_scales_path):
@@ -1174,6 +1176,8 @@ def run_conversion(args):
                     return
                 input_scales = load_input_scales(args.input_scales_path)
                 print(f"Loaded {len(input_scales)} input scales from: {args.input_scales_path}")
+            elif actcal_scales:
+                input_scales = actcal_scales
 
             # Call convert_to_nvfp4 with explicit args (no **kwargs footgun)
             convert_to_nvfp4(
@@ -1385,7 +1389,7 @@ def run_conversion(args):
         )
         return
 
-    # Handle activation scale calibration mode (separate workflow)
+    # Handle activation scale calibration mode
     if args.actcal:
         try:
             from ..calibrate_activation_scales import (
@@ -1407,19 +1411,11 @@ def run_conversion(args):
                     patch_model_with_scales,
                 )
 
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_calibrated.safetensors"
-
         if not os.path.exists(args.input):
             print(f"Error: Input file not found: {args.input}")
             return
 
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        print(f"Loading model: {args.input}")
+        print(f"Loading model for activation calibration: {args.input}")
         tensors = load_file(args.input)
         print(f"  Total tensors: {len(tensors)}")
 
@@ -1435,7 +1431,7 @@ def run_conversion(args):
 
         mode = "LoRA-informed" if lora_tensors else "random"
         print(f"\nCalibrating input_scale using {mode} PTQ ({args.actcal_samples} samples)...")
-        scales = calibrate_model(
+        actcal_scales = calibrate_model(
             tensors,
             calib_samples=args.actcal_samples,
             seed=args.actcal_seed,
@@ -1444,16 +1440,42 @@ def run_conversion(args):
             lora_tensors=lora_tensors,
             device=args.actcal_device,
         )
-        print(f"\nCalibrated {len(scales)} layers")
+        print(f"\nCalibrated {len(actcal_scales)} layers")
+        args.input_scale = True
 
-        print("\nPatching model with calibrated scales...")
-        patched = patch_model_with_scales(tensors, scales)
+        # Check if user requested a quantization workflow in the same command
+        is_quantization_requested = bool(
+            getattr(args, "int4", False)
+            or args.nvfp4
+            or args.mxfp8
+            or args.int8
+            or args.convert_fp8_scaled
+            or args.convert_int8_scaled
+            or args.custom_layers
+            or args.custom_type
+        )
 
-        print(f"Saving to: {args.output}")
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-        save_file(patched, args.output)
-        print("Done!")
-        return
+        if not is_quantization_requested:
+            if not args.output:
+                base = os.path.splitext(args.input)[0]
+                args.output = f"{base}_calibrated.safetensors"
+
+            if os.path.abspath(args.input) == os.path.abspath(args.output):
+                print("Error: Output file cannot be same as input.")
+                return
+
+            print("\nPatching model with calibrated scales...")
+            patched = patch_model_with_scales(tensors, actcal_scales)
+
+            print(f"Saving to: {args.output}")
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            save_file(patched, args.output)
+            print("Done!")
+            return
+        else:
+            del tensors
+            import gc
+            gc.collect()
 
     # Handle comfy_quant editing mode (separate workflow)
     if args.edit_quant:
@@ -1578,6 +1600,17 @@ def run_conversion(args):
     if args.layer_config:
         layer_config_data = load_layer_config(args.layer_config)
 
+    # Load input scales if provided or calibrated
+    input_scales = None
+    if args.input_scales_path:
+        if not os.path.exists(args.input_scales_path):
+            print(f"Error: Input scales file not found: {args.input_scales_path}")
+            return
+        input_scales = load_input_scales(args.input_scales_path)
+        print(f"Loaded {len(input_scales)} input scales from: {args.input_scales_path}")
+    elif actcal_scales:
+        input_scales = actcal_scales
+
     # Determine primary_format for INT4/NVFP4/MXFP8 mode
     primary_format = None
     if getattr(args, "int4", False):
@@ -1668,6 +1701,7 @@ def run_conversion(args):
         lora_depth=args.lora_depth,
         lora_ar_threshold=args.lora_ar_threshold,
         lora_output=args.lora_output,
+        input_scales=input_scales,
     )
 
 
