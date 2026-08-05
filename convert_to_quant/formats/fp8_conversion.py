@@ -75,6 +75,7 @@ def convert_to_fp8_scaled(
     # Added for CLI compatibility
     lora_output: Optional[str] = None,
     input_scales: Optional[Dict[str, Any]] = None,
+    actcal_lora: Optional[str] = None,
     **converter_kwargs,
 ):
     # Ensure filter_flags is a dict
@@ -289,9 +290,24 @@ def convert_to_fp8_scaled(
                 shutil.rmtree(calib_cache_dir)
             return
 
+    lora_key_map = {}
+    if actcal_lora and os.path.exists(actcal_lora):
+        try:
+            from ..calibrate_activation_scales import build_lora_key_map, load_lora_tensors
+            info(f"Loading LoRA for weight optimization calibration: {actcal_lora}")
+            actcal_lora_tensors = load_lora_tensors(actcal_lora)
+            all_linear_bases = [k[:-7] for k in all_keys if k.endswith(".weight") and loader.get_ndim(k) == 2]
+            lora_key_map = build_lora_key_map(all_linear_bases, actcal_lora_tensors)
+            info(f"Matched {len(lora_key_map)} layers with LoRA calibration data for weight optimization")
+        except Exception as e:
+            warning(f"Failed to load LoRA for weight optimization calibration: {e}")
+
     calibration_data_cache = {}
     # Generate calibration data for bias correction (always, even in simple mode)
-    minimal("Scanning model and generating simulated calibration data...")
+    if lora_key_map:
+        minimal("Scanning model and preparing LoRA-informed calibration data for weight optimization...")
+    else:
+        minimal("Scanning model and generating simulated calibration data...")
     for key in all_keys:
         if key.endswith(".weight"):
             shape = loader.get_shape(key)
@@ -482,14 +498,30 @@ def convert_to_fp8_scaled(
             dequant_s = block_scales
         else:
             in_features = original_tensor.shape[1]
-            cache_entry = calibration_data_cache.get(in_features)
-            calib_data_loaded = False
-            if isinstance(cache_entry, str):
-                with MemoryEfficientSafeOpen(cache_entry, low_memory=True) as calib_loader:
-                    calibration_data = calib_loader.get_tensor("calib_data")
-                calib_data_loaded = True
+            base_name = key[: key.rfind(".weight")]
+
+            lora_calib = None
+            if lora_key_map and base_name in lora_key_map and "lora_A" in lora_key_map[base_name]:
+                lora_A = lora_key_map[base_name]["lora_A"]
+                x_base = lora_A.to(dtype=COMPUTE_DTYPE, device="cpu")
+                gen = torch.Generator(device="cpu").manual_seed(seed)
+                n1 = torch.randn(x_base.shape, generator=gen, dtype=COMPUTE_DTYPE)
+                n2 = torch.randn(x_base.shape, generator=gen, dtype=COMPUTE_DTYPE)
+                x_calib = torch.cat([x_base, x_base + 0.1 * n1, x_base + 0.2 * n2, x_base * -1])
+                lora_calib = x_calib / x_calib.std().clamp(min=1e-6)
+
+            if lora_calib is not None:
+                calibration_data = lora_calib
+                calib_data_loaded = False
             else:
-                calibration_data = cache_entry
+                cache_entry = calibration_data_cache.get(in_features)
+                calib_data_loaded = False
+                if isinstance(cache_entry, str):
+                    with MemoryEfficientSafeOpen(cache_entry, low_memory=True) as calib_loader:
+                        calibration_data = calib_loader.get_tensor("calib_data")
+                    calib_data_loaded = True
+                else:
+                    calibration_data = cache_entry
 
             q_tensor, dequant_s, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, calibration_data=calibration_data, has_bias=has_bias)
 
@@ -633,7 +665,9 @@ def convert_to_fp8_scaled(
                 with torch.no_grad():
                     original_bias = loader.get_tensor(bias_key)
                     in_features = original_tensor.shape[1]
-                    if in_features not in calibration_data_cache:
+                    if lora_calib is not None:
+                        calib_data = lora_calib
+                    elif in_features not in calibration_data_cache:
                         warning(f"  - WARNING: No calibration data for bias correction of {bias_key}.")
                         res_tensors[bias_key] = original_bias.to("cpu")
                     else:

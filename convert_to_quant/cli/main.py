@@ -1702,6 +1702,7 @@ def run_conversion(args):
         lora_ar_threshold=args.lora_ar_threshold,
         lora_output=args.lora_output,
         input_scales=input_scales,
+        actcal_lora=args.actcal_lora,
     )
 
 
