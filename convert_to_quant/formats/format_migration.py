@@ -394,6 +394,7 @@ def scan_and_replace_comfy_quant_metadata(
         "scaled_fp8",
         "scaled_int8",
         "bitsandbytes",
+        "format",
         "_quantization_metadata",
     }
 
