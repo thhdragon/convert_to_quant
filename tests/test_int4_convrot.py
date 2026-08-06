@@ -127,6 +127,46 @@ def test_convert_to_fp8_scaled_int4_comfy_quant(tmp_path):
         cq_tensor = f.get_tensor("layer1.comfy_quant")
         cq_dict = tensor_to_dict(cq_tensor)
         assert cq_dict["format"] == "convrot_w4a4"
-        assert cq_dict["format"] != "float8_e4m3fn_rowwise"
+
+def test_w4a4_adaround_quantized_activations():
+    """Verify that INT4 AdaRound optimization and bias correction account for quantized activations."""
+    torch.manual_seed(42)
+    converter = LearnedINT4Converter(
+        device="cpu",
+        no_learned_rounding=False,
+        num_iter=10,
+        optimizer="adamw",
+        lr=0.5,
+        convrot=True,
+        convrot_group_size=256,
+    )
+    weight = torch.randn(16, 256, dtype=torch.float32)
+    bias = torch.randn(16, dtype=torch.float32)
+    calib = torch.randn(32, 256, dtype=torch.float32)
+
+    qdata, scale, dequantized, extra = converter.convert(weight, bias=bias, calibration_data=calib)
+    assert qdata.shape == (16, 128)
+    assert scale.shape == (16,)
+    assert "bias_correction" in extra
+
+    # Evaluate using actual W4A4 linear operator (which quantizes activations to INT4)
+    out_quant = convrot_w4a4_linear(calib, qdata, scale, bias=bias + extra["bias_correction"].to(calib.device))
+    ref_out = calib @ weight.t() + bias
+    mse_opt = torch.nn.functional.mse_loss(out_quant, ref_out).item()
+
+    # Compare with simple rounding (no learned rounding)
+    converter_simple = LearnedINT4Converter(
+        device="cpu",
+        no_learned_rounding=True,
+        convrot=True,
+        convrot_group_size=256,
+    )
+    qdata_simple, scale_simple, _, extra_simple = converter_simple.convert(weight, bias=bias, calibration_data=calib)
+    bias_simple = bias + extra_simple["bias_correction"].to(calib.device) if "bias_correction" in extra_simple else bias
+    out_simple = convrot_w4a4_linear(calib, qdata_simple, scale_simple, bias=bias_simple)
+    mse_simple = torch.nn.functional.mse_loss(out_simple, ref_out).item()
+
+    assert mse_opt <= mse_simple
+
 
 

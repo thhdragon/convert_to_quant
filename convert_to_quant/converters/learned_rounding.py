@@ -1078,8 +1078,12 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             and X_rot is not None
             and Y_ref is not None
         ):
+            from ..comfy.int4_kernels import quantize_signed_int4_rowwise
+
             with torch.no_grad():
-                Y_quant = X_rot @ dequantized_rot.T
+                qact, x_scales = quantize_signed_int4_rowwise(X_rot)
+                act_dequant = unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
+                Y_quant = act_dequant @ dequantized_rot.T
                 bias_adj = (Y_ref - Y_quant).mean(dim=0)
                 self._current_extra_tensors["bias_correction"] = bias_adj.cpu()
                 info(
@@ -1104,8 +1108,15 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         minimizing local activation reconstruction MSE using the cached calibration data for INT4 W4A4.
         """
         from ..utils.convrot import pack_int4_row_major, unpack_int4_row_major
+        from ..comfy.int4_kernels import quantize_signed_int4_rowwise
 
         M, N = W_float32.shape
+
+        # Pre-compute row-wise INT4 quantized activations for W4A4 matmul matching runtime kernel
+        with torch.no_grad():
+            qact, x_scales = quantize_signed_int4_rowwise(X_rot)
+            act_dequant = unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
+            del qact, x_scales
 
         # 1. Compute SVD components of rotated parameter matrix
         U_k, Vh_k, k = self._compute_svd_components(W_float32, verbose=True)
@@ -1145,7 +1156,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         with torch.no_grad():
             init_W_q_rounded = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE)
             init_W_rounded_dequant = init_W_q_rounded * scale_broadcast
-            init_mse_rounded = torch.nn.functional.mse_loss(X_rot @ init_W_rounded_dequant.T, Y_ref)
+            init_mse_rounded = torch.nn.functional.mse_loss(act_dequant @ init_W_rounded_dequant.T, Y_ref)
             init_svd_rounded = torch.linalg.norm(
                 U_k.T @ (init_W_rounded_dequant - W_float32) @ Vh_k.T
             )
@@ -1209,7 +1220,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             )
 
             # Loss 1: Output activation MSE
-            Y_pred = X_rot @ W_dequant.T
+            Y_pred = act_dequant @ W_dequant.T
             loss_mse = torch.nn.functional.mse_loss(Y_pred, Y_ref)
 
             # Loss 2: SVD-guided weight-space projection error
@@ -1362,7 +1373,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries."
             )
 
-        self._cleanup_tensors(U_k, Vh_k, V)
+        self._cleanup_tensors(U_k, Vh_k, V, act_dequant)
         return opt_qdata, scale
 
     def _convert_int8_tensorwise(
