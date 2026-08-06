@@ -17,7 +17,10 @@ from safetensors.torch import load_file, save_file
 from ..config.layer_config import generate_config_template, get_layer_settings, load_layer_config
 from ..constants import MODEL_FILTERS, TARGET_FP8_DTYPE
 from ..formats.dequantization import dequantize_model
-from ..formats.format_migration import convert_fp8_scaled_to_comfy_quant
+from ..formats.format_migration import (
+    convert_fp8_scaled_to_comfy_quant,
+    scan_and_replace_comfy_quant_metadata,
+)
 from ..formats.fp8_conversion import convert_to_fp8_scaled
 from ..formats.hybrid_mxfp8_conversion import convert_to_hybrid_mxfp8
 from ..formats.int8_conversion import convert_int8_to_comfy_quant
@@ -796,6 +799,13 @@ def get_parser() -> MultiHelpArgumentParser:
         dest="convert_int8_scaled",
         help="Convert legacy INT8 model (.scale_weight) to comfy_quant format (.weight_scale + metadata)",
     )
+    parser.add_argument(
+        "--replace-quant-metadata",
+        "--replace_quant_metadata",
+        action="store_true",
+        dest="replace_quant_metadata",
+        help="Scan quantized model, auto-detect layer quantization formats, and replace header and layer metadata with ComfyQuant metadata.",
+    )
 
     # Legacy input scale addition mode
     parser.add_argument(
@@ -1119,6 +1129,32 @@ def run_conversion(args):
             block_size=int8_block_size,
             include_input_scale=args.input_scale,
             save_quant_metadata=args.save_quant_metadata,
+        )
+        return
+
+    # Handle scan and replace metadata mode (separate workflow)
+    if args.replace_quant_metadata:
+        if not args.output:
+            base = os.path.splitext(args.input)[0]
+            args.output = f"{base}_comfy_metadata.safetensors"
+
+        if not os.path.exists(args.input):
+            print(f"Error: Input file not found: {args.input}")
+            return
+
+        if os.path.abspath(args.input) == os.path.abspath(args.output):
+            print("Error: Output file cannot be same as input.")
+            return
+
+        scan_and_replace_comfy_quant_metadata(
+            args.input,
+            args.output,
+            default_block_size=args.block_size,
+            full_precision_mm=args.full_precision_mm,
+            include_input_scale=args.input_scale,
+            int4=getattr(args, "int4", False),
+            convrot=getattr(args, "convrot", False),
+            convrot_group_size=getattr(args, "convrot_group_size", 256),
         )
         return
 

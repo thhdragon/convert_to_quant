@@ -18,7 +18,7 @@ from tqdm import tqdm
 from ..constants import COMPUTE_DTYPE, NORMALIZE_SCALES_ENABLED, SCALE_DTYPE, TARGET_FP8_DTYPE
 from ..utils.comfy_quant import create_comfy_quant_tensor, fix_comfy_quant_params_structure
 from ..utils.logging import debug, error, info, log_debug, minimal, verbose, warning
-from ..utils.tensor_utils import dict_to_tensor, normalize_tensorwise_scales
+from ..utils.tensor_utils import dict_to_tensor, normalize_tensorwise_scales, tensor_to_dict
 
 
 def convert_fp8_scaled_to_comfy_quant(input_file: str, output_file: str, hp_filter: Optional[str] = None, full_precision_mm: bool = False, include_input_scale: bool = False, save_quant_metadata: bool = True):
@@ -323,3 +323,323 @@ def convert_fp8_scaled_to_comfy_quant(input_file: str, output_file: str, hp_filt
     except Exception as e:
         error(f"FATAL: Error saving file '{output_file}': {e}")
         return
+
+
+def scan_and_replace_comfy_quant_metadata(
+    input_file: str,
+    output_file: str,
+    default_block_size: Optional[int] = None,
+    full_precision_mm: bool = False,
+    include_input_scale: bool = False,
+    strip_non_comfy_metadata: bool = True,
+    int4: bool = False,
+    convrot: bool = False,
+    convrot_group_size: int = 256,
+):
+    """
+    Scan a quantized model, auto-detect layer quantization formats,
+    generate/replace .comfy_quant tensors, and replace header metadata with
+    standardized ComfyQuant _quantization_metadata.
+
+    This function inspects all layers and:
+    1. Standardizes legacy scale tensor names (.scale_weight -> .weight_scale, .scale_input -> .input_scale).
+    2. Auto-detects layer quantization format (FP8, INT8, NVFP4, MXFP8, ConvRot W4A4, etc.)
+       and quantization parameters (block/group size, matrix mult flags).
+    3. Creates or updates .comfy_quant tensors for all quantized layers.
+    4. Strips obsolete/non-comfy quantization metadata keys from the safetensors header
+       (e.g., quantization_config, quant_method, scaled_fp8, scaled_int8, etc.).
+    5. Populates header metadata with _quantization_metadata.
+
+    Args:
+        input_file: Path to input safetensors model file
+        output_file: Path to output safetensors model file
+        default_block_size: Default block/group size for blockwise formats (defaults: FP8/INT8=128, INT4=64)
+        full_precision_mm: Set full_precision_matrix_mult=True in generated layer configs
+        include_input_scale: Add default input_scale tensor (1.0 fp32) for quantized layers missing it
+        strip_non_comfy_metadata: Strip non-comfy quantization metadata header keys
+        int4: Force INT4 / ConvRot W4A4 quantization format detection
+        convrot: Force ConvRot Hadamard rotation flag
+        convrot_group_size: ConvRot group size (default 256)
+    """
+    info("Scanning model and replacing metadata with ComfyQuant format")
+    info(f"Input:  {input_file}")
+    info(f"Output: {output_file}")
+    info("-" * 60)
+
+    # Load input tensors and original header metadata
+    tensors: Dict[str, torch.Tensor] = {}
+    original_metadata: Dict[str, str] = {}
+    try:
+        with safe_open(input_file, framework="pt", device="cpu") as f:
+            original_metadata = f.metadata() or {}
+            minimal(f"Loading {len(f.keys())} tensors from source file...")
+            for key in tqdm(f.keys(), desc="Loading tensors"):
+                tensors[key] = f.get_tensor(key)
+    except Exception as e:
+        error(f"FATAL: Error loading '{input_file}': {e}")
+        return
+
+    # Check if original header metadata hints at ConvRot / INT4
+    header_is_convrot = any(
+        s in str(k).lower() or s in str(v).lower()
+        for k, v in original_metadata.items()
+        for s in ("convrot", "w4a4", "int4_convrot", "convrot_w4a4")
+    )
+
+    # Non-comfy quantization metadata keys to purge from file header
+    NON_COMFY_QUANT_META_KEYS = {
+        "quantization_config",
+        "quant_method",
+        "quantization",
+        "scaled_fp8",
+        "scaled_int8",
+        "bitsandbytes",
+        "_quantization_metadata",
+    }
+
+    # Prepare cleaned file header metadata
+    output_metadata: Dict[str, str] = {}
+    removed_header_keys = []
+    for k, v in original_metadata.items():
+        if strip_non_comfy_metadata and k in NON_COMFY_QUANT_META_KEYS:
+            removed_header_keys.append(k)
+        else:
+            output_metadata[k] = v
+
+    if removed_header_keys:
+        info(f"Purging non-comfy quantization header metadata keys: {removed_header_keys}")
+
+    # Group tensors by layer base name
+    layer_info: Dict[str, Dict[str, torch.Tensor]] = {}
+    other_tensors: Dict[str, torch.Tensor] = {}
+
+    QUANT_SUFFIXES = (
+        ".weight",
+        ".comfy_quant",
+        ".weight_scale",
+        ".scale_weight",
+        ".input_scale",
+        ".scale_input",
+        ".per_tensor_scale",
+    )
+
+    for key, tensor in tensors.items():
+        if key in ("scaled_fp8", "scaled_int8"):
+            continue  # Strip obsolete marker tensors
+
+        matched_suffix = None
+        for suffix in QUANT_SUFFIXES:
+            if key.endswith(suffix):
+                matched_suffix = suffix
+                break
+
+        if matched_suffix:
+            base = key[:-len(matched_suffix)]
+            field = matched_suffix[1:]
+            if base not in layer_info:
+                layer_info[base] = {}
+            layer_info[base][field] = tensor
+        else:
+            other_tensors[key] = tensor
+
+    output_tensors: Dict[str, torch.Tensor] = {}
+    quant_metadata_layers: Dict[str, Any] = {}
+    quantized_layer_count = 0
+    detected_formats: Dict[str, int] = {}
+
+    for base_name, layer_data in tqdm(layer_info.items(), desc="Scanning layers"):
+        weight = layer_data.get("weight")
+        existing_comfy_quant = layer_data.get("comfy_quant")
+        weight_scale = (
+            layer_data.get("weight_scale")
+            if layer_data.get("weight_scale") is not None
+            else layer_data.get("scale_weight")
+        )
+        input_scale = (
+            layer_data.get("input_scale")
+            if layer_data.get("input_scale") is not None
+            else layer_data.get("scale_input")
+        )
+        per_tensor_scale = layer_data.get("per_tensor_scale")
+
+        if weight is None:
+            # Pass through non-weight layer components
+            for sub_k, sub_v in layer_data.items():
+                if sub_k not in ("scale_weight", "scale_input", "comfy_quant"):
+                    output_tensors[f"{base_name}.{sub_k}"] = sub_v
+            continue
+
+        # Standardize weight output
+        output_tensors[f"{base_name}.weight"] = weight
+
+        # Check existing comfy_quant tensor config first
+        existing_config: Optional[Dict[str, Any]] = None
+        if existing_comfy_quant is not None:
+            try:
+                fixed_cq, _ = fix_comfy_quant_params_structure(existing_comfy_quant)
+                existing_config = tensor_to_dict(fixed_cq)
+            except Exception:
+                existing_config = None
+
+        # Determine if this layer is quantized
+        is_fp8 = weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        is_integer = weight.dtype in (torch.int8, torch.uint8)
+        has_scales = weight_scale is not None or per_tensor_scale is not None
+        is_quantized = is_fp8 or is_integer or has_scales or (existing_config is not None)
+
+        if is_quantized:
+            quantized_layer_count += 1
+
+            # Standardize scale tensors
+            if weight_scale is not None:
+                output_tensors[f"{base_name}.weight_scale"] = weight_scale
+            if input_scale is not None:
+                output_tensors[f"{base_name}.input_scale"] = input_scale
+            elif include_input_scale:
+                output_tensors[f"{base_name}.input_scale"] = torch.tensor(1.0, dtype=torch.float32)
+            if per_tensor_scale is not None:
+                output_tensors[f"{base_name}.per_tensor_scale"] = per_tensor_scale
+
+            # Infer or decode format parameters
+            format_type = "float8_e4m3fn" if is_fp8 else "int8_blockwise"
+            block_size: Optional[int] = None
+            fpmm = full_precision_mm if full_precision_mm else None
+            convrot_flag: Optional[bool] = convrot if convrot else None
+            convrot_gs: Optional[int] = convrot_group_size if convrot else None
+            per_row: Optional[bool] = None
+
+            # Detect ConvRot / INT4 indicators
+            is_convrot_layer = int4 or convrot or header_is_convrot
+            if existing_config:
+                existing_fmt = str(existing_config.get("format", "")).lower()
+                if existing_fmt in ("convrot_w4a4", "int4_convrot", "int4", "int4_blockwise", "w4a4") or existing_config.get("convrot") is True:
+                    is_convrot_layer = True
+
+            if existing_config:
+                format_type = existing_config.get("format", format_type)
+                block_size = existing_config.get("group_size") or existing_config.get("block_size")
+                if "full_precision_matrix_mult" in existing_config:
+                    fpmm = existing_config["full_precision_matrix_mult"]
+                if existing_config.get("convrot") is True:
+                    convrot_flag = True
+                    convrot_gs = existing_config.get("convrot_groupsize", convrot_group_size)
+                per_row = existing_config.get("per_row")
+
+            M, N = weight.shape[0], weight.shape[1] if weight.ndim >= 2 else 1
+
+            if is_convrot_layer and is_integer:
+                format_type = "convrot_w4a4" if format_type not in ("convrot_w4a4", "int4_convrot") else format_type
+                convrot_flag = True
+                convrot_gs = convrot_gs or convrot_group_size
+                if block_size is None:
+                    block_size = default_block_size if default_block_size is not None else 64
+            elif is_fp8 and (not existing_config or "format" not in existing_config):
+                if weight_scale is None or weight_scale.numel() == 1:
+                    format_type = "float8_e4m3fn"
+                    block_size = None
+                elif weight_scale.ndim == 1:
+                    if weight_scale.shape[0] == M:
+                        format_type = "float8_e4m3fn_rowwise"
+                        block_size = None
+                    else:
+                        scale_count = weight_scale.shape[0]
+                        total_elements = M * N
+                        if scale_count > 0 and total_elements % scale_count == 0:
+                            bs_sq = total_elements // scale_count
+                            bs = int(bs_sq**0.5)
+                            if bs * bs == bs_sq:
+                                format_type = "float8_e4m3fn_blockwise"
+                                block_size = bs
+                elif weight_scale.ndim == 2:
+                    scale_M, scale_N = weight_scale.shape
+                    if M % scale_M == 0 and N % scale_N == 0:
+                        bs_M, bs_N = M // scale_M, N // scale_N
+                        format_type = "float8_e4m3fn_blockwise"
+                        block_size = bs_M if bs_M == bs_N else min(bs_M, bs_N)
+
+            elif is_integer and (not existing_config or "format" not in existing_config):
+                fallback_bs = default_block_size if default_block_size is not None else 128
+                if weight_scale is None or weight_scale.numel() == 1:
+                    format_type = "int8_tensorwise"
+                    block_size = None
+                elif weight_scale.ndim == 1:
+                    if weight_scale.shape[0] in (M, N):
+                        format_type = "int8_tensorwise"
+                        block_size = None
+                    else:
+                        format_type = "int8_blockwise"
+                        block_size = fallback_bs
+                elif weight_scale.ndim == 2:
+                    scale_M, scale_N = weight_scale.shape
+                    if scale_M == N and scale_N == 1:
+                        format_type = "int8_tensorwise"
+                        block_size = None
+                    elif M % scale_M == 0 and N % scale_N == 0:
+                        bs_M, bs_N = M // scale_M, N // scale_N
+                        format_type = "int8_blockwise"
+                        block_size = bs_M if bs_M == bs_N else min(bs_M, bs_N)
+                    else:
+                        format_type = "int8_blockwise"
+                        block_size = fallback_bs
+
+            # Ensure block-based formats have group_size set
+            if format_type in ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4", "int4_convrot") and block_size is None:
+                block_size = default_block_size if default_block_size is not None else (64 if format_type in ("convrot_w4a4", "int4_convrot") else 128)
+
+            # Create updated .comfy_quant tensor
+            comfy_quant_tensor = create_comfy_quant_tensor(
+                format_type=format_type,
+                block_size=block_size,
+                full_precision_matrix_mult=fpmm,
+                convrot=convrot_flag,
+                convrot_groupsize=convrot_gs,
+                per_row=per_row,
+            )
+            output_tensors[f"{base_name}.comfy_quant"] = comfy_quant_tensor
+
+            # Build metadata entry
+            meta_entry = tensor_to_dict(comfy_quant_tensor)
+            quant_metadata_layers[base_name] = meta_entry
+            detected_formats[format_type] = detected_formats.get(format_type, 0) + 1
+
+
+    # Preserve other non-layer tensors
+    for key, tensor in other_tensors.items():
+        if key.endswith(".comfy_quant"):
+            fixed_tensor, _ = fix_comfy_quant_params_structure(tensor)
+            output_tensors[key] = fixed_tensor
+        else:
+            output_tensors[key] = tensor
+
+    # Populate header _quantization_metadata JSON
+    if quant_metadata_layers:
+        full_metadata = {"format_version": "1.0", "layers": quant_metadata_layers}
+        output_metadata["_quantization_metadata"] = json.dumps(full_metadata)
+        info(f"Populated _quantization_metadata header with {len(quant_metadata_layers)} layer entries")
+
+    # Summary
+    info("-" * 60)
+    info("Scan & Replace Summary:")
+    info(f"  Quantized layers processed: {quantized_layer_count}")
+    info(f"  Total output tensors:       {len(output_tensors)}")
+    if detected_formats:
+        info("  Layer formats detected:")
+        for fmt, count in sorted(detected_formats.items(), key=lambda x: -x[1]):
+            info(f"    {fmt}: {count} layers")
+    info("-" * 60)
+
+    # Save output file
+    info(f"\nSaving to {output_file}...")
+    try:
+        os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else ".", exist_ok=True)
+        output_tensors, normalized_count = normalize_tensorwise_scales(output_tensors, NORMALIZE_SCALES_ENABLED)
+        if normalized_count > 0:
+            verbose(f"  Normalized {normalized_count} scale tensors to scalars")
+
+        save_kwargs = {"metadata": output_metadata} if output_metadata else {}
+        save_file(output_tensors, output_file, **save_kwargs)
+        info("Metadata scan and replacement complete!")
+    except Exception as e:
+        error(f"FATAL: Error saving file '{output_file}': {e}")
+        return
+

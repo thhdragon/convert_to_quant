@@ -88,9 +88,11 @@ MODES_ARGS = {
     # Format conversion modes
     "convert_fp8_scaled",
     "convert_int8_scaled",
+    "replace_quant_metadata",
     "make_hybrid_mxfp8",
     "tensor_scales_path",
     # Model dequantization
+
     "dequantize",
     "dequant_dtype",
     # Legacy operations

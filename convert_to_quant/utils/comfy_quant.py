@@ -18,7 +18,7 @@ from .logging import error, info, minimal, verbose, warning
 from .tensor_utils import dict_to_tensor, normalize_tensorwise_scales, tensor_to_dict
 
 # Block-based formats that require group_size
-BLOCK_BASED_FORMATS = ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4")
+BLOCK_BASED_FORMATS = ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4", "int4_convrot", "int4_blockwise")
 
 
 

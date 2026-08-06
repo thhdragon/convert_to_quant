@@ -1,17 +1,15 @@
-"""
-Learned Rounding INT4 Quantization Converter.
+"""Learned Rounding INT4 Quantization Converter.
 
 Implements INT4 W4A4 quantization with ConvRot group-wise Hadamard rotation
 and optional SVD-based learned rounding optimization.
 """
 
-from typing import Optional
 from .learned_rounding import LearnedRoundingConverter
 
 
 class LearnedINT4Converter(LearnedRoundingConverter):
-    """
-    Converter for INT4 W4A4 ConvRot quantization.
+    """Convert to INT4 W4A4 ConvRot quantization.
+
     Sets target_format="int4", convrot=True, and scaling_mode="row" by default.
     """
 
