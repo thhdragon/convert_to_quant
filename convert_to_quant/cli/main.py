@@ -1442,6 +1442,12 @@ def run_conversion(args):
                 convrot_group_size=args.convrot_group_size,
                 low_memory=args.low_memory,
                 devices=target_devices,
+                extract_lora=args.extract_lora,
+                lora_rank=args.lora_rank,
+                lora_target=args.lora_target,
+                lora_depth=args.lora_depth,
+                lora_ar_threshold=args.lora_ar_threshold,
+                lora_output=args.lora_output,
             )
             return
 

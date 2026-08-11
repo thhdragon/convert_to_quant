@@ -177,7 +177,12 @@ class LearnedMXFP8Converter(BaseLearnedConverter):
         # Error Correction LoRA extraction
         extra_tensors = {}
         if self._should_extract_lora(key, orig_shape, depth):
-            lora_data = self._extract_error_lora(W_float32_for_lora, dequantized)
+            dequantized_unpadded = (
+                dequantized[: orig_shape[0], : orig_shape[1]]
+                if (dequantized is not None and dequantized.shape != orig_shape)
+                else dequantized
+            )
+            lora_data = self._extract_error_lora(W_float32_for_lora, dequantized_unpadded)
             if lora_data:
                 extra_tensors.update(lora_data)
 

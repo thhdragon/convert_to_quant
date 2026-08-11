@@ -422,6 +422,10 @@ def scan_and_replace_comfy_quant_metadata(
         ".input_scale",
         ".scale_input",
         ".per_tensor_scale",
+        "._s_rel",
+        "._s_channel",
+        "._codebook",
+        "._correction",
     )
 
     for key, tensor in tensors.items():
@@ -518,7 +522,7 @@ def scan_and_replace_comfy_quant_metadata(
                     is_convrot_layer = True
                 elif existing_fmt in ("w4a8_int8", "asym_w4a8_int8", "w4a8", "asymw4a8int8layout"):
                     is_w4a8_layer = True
-            elif data.get("_s_rel") is not None and data.get("_s_channel") is not None:
+            elif layer_data.get("_s_rel") is not None and layer_data.get("_s_channel") is not None:
                 is_w4a8_layer = True
 
             if existing_config:

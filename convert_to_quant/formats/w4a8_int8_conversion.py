@@ -29,7 +29,7 @@ def convert_to_w4a8_int8(
     simple: bool = False,
     group_size: int = 16,
     convrot_group_size: int = 256,
-    scale_dtype: str = "float8_e4m3fn",
+    scale_dtype: str = "float32",  # gfx1150 falls back to widened bf16
     symmetric: bool = True,
     codebook: bool = True,
     low_memory: bool = False,

@@ -15,7 +15,7 @@ from tqdm import tqdm
 from ..constants import NORMALIZE_SCALES_ENABLED
 from ..utils.comfy_quant import create_comfy_quant_tensor, fix_comfy_quant_params_structure
 from ..utils.logging import error, info, minimal, verbose, warning
-from ..utils.tensor_utils import normalize_tensorwise_scales, tensor_to_dict
+from ..utils.tensor_utils import normalize_tensorwise_scales
 
 
 def convert_int4_to_comfy_quant(input_file: str, output_file: str, block_size: int = 64, convrot_group_size: int = 256, save_quant_metadata: bool = True):

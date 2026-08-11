@@ -164,3 +164,35 @@ def test_scan_and_replace_cli_parser():
     args_alias = parser.parse_args(["-i", "input.safetensors", "--replace_quant_metadata"])
     assert args_alias.replace_quant_metadata is True
 
+
+def test_scan_and_replace_metadata_w4a8():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input_w4a8.safetensors")
+        output_path = os.path.join(tmpdir, "output_w4a8.safetensors")
+
+        out_f, in_f = 64, 128
+        qweight = torch.randint(-127, 127, (out_f, in_f // 2), dtype=torch.int8)
+        s_rel = torch.ones((out_f, in_f // 16), dtype=torch.float32) * 0.05
+        s_channel = torch.ones((out_f, 1), dtype=torch.float32)
+
+        tensors = {
+            "model.layer_w4a8.weight": qweight,
+            "model.layer_w4a8._s_rel": s_rel,
+            "model.layer_w4a8._s_channel": s_channel,
+        }
+
+        save_file(tensors, input_path)
+
+        scan_and_replace_comfy_quant_metadata(input_path, output_path)
+
+        with safe_open(output_path, framework="pt", device="cpu") as f:
+            res_meta = f.metadata() or {}
+            assert "_quantization_metadata" in res_meta
+
+            qmeta = json.loads(res_meta["_quantization_metadata"])
+            layer_meta = qmeta.get("layers", {}).get("model.layer_w4a8")
+            assert layer_meta is not None
+            assert layer_meta.get("format") == "w4a8_int8"
+            assert layer_meta.get("convrot") is True
+
+

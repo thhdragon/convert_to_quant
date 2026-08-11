@@ -822,6 +822,8 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
                         return quantized_tensor, dequant_scale, torch.zeros_like(W_float32), {}
 
+                    W_orig_float32 = W_float32.clone() if self.extract_lora else None
+
                     # Target format routing
                     if self.target_format in ("int4", "convrot_w4a4"):
                         qdata, scale, dequantized = self._convert_int4_convrot(
@@ -852,7 +854,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     extra_tensors = self._current_extra_tensors.copy()
                     self._current_extra_tensors.clear()
                     if self._should_extract_lora(key, W_orig.shape, depth):
-                        lora_data = self._extract_error_lora(W_float32, dequantized)
+                        lora_data = self._extract_error_lora(W_orig_float32, dequantized)
                         if lora_data:
                             extra_tensors.update(lora_data)
 

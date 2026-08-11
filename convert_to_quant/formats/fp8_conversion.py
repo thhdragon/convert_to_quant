@@ -552,6 +552,16 @@ def convert_to_fp8_scaled(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+        if extra_tensors:
+            base_key = key[: key.rfind(".weight")]
+            for lora_key, lora_tensor in extra_tensors.items():
+                if lora_key in ("lora_up", "lora_down"):
+                    if base_key.startswith("diffusion_model.") or base_key.startswith("text_encoders."):
+                        full_lora_key = f"{base_key}.{lora_key}.weight"
+                    else:
+                        full_lora_key = f"diffusion_model.{base_key}.{lora_key}.weight"
+                    res_lora[full_lora_key] = lora_tensor.cpu()
+
         res_tensors[key] = q_tensor.to(device="cpu")
         base_name = key[: key.rfind(".weight")]
         bias_key = f"{base_name}.bias"

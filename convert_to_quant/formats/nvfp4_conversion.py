@@ -104,6 +104,7 @@ def convert_to_nvfp4(
     lora_depth: int = -1,
     lora_ar_threshold: float = 0.0,
     lora_save_path: Optional[str] = None,
+    lora_output: Optional[str] = None,
     # Device options
     device: Optional[str] = None,
     devices: Optional[Union[str, List[str]]] = None,
@@ -295,8 +296,12 @@ def convert_to_nvfp4(
 
         if extra_tensors:
             for lora_key, lora_tensor in extra_tensors.items():
-                full_lora_key = f"diffusion_model.{base_key}.{lora_key}.weight"
-                res_lora[full_lora_key] = lora_tensor.cpu()
+                if lora_key in ("lora_up", "lora_down"):
+                    if base_key.startswith("diffusion_model.") or base_key.startswith("text_encoders."):
+                        full_lora_key = f"{base_key}.{lora_key}.weight"
+                    else:
+                        full_lora_key = f"diffusion_model.{base_key}.{lora_key}.weight"
+                    res_lora[full_lora_key] = lora_tensor.cpu()
 
         res_tensors[key] = qdata.cpu()
         res_tensors[f"{base_key}.weight_scale_2"] = per_tensor_scale.cpu().to(torch.float32)

@@ -150,7 +150,11 @@ class BaseLearnedConverter(ABC):
             import re
 
             try:
-                self.lora_target_regex = re.compile(lora_target)
+                if isinstance(lora_target, (list, tuple)):
+                    pattern_str = "|".join(lora_target)
+                else:
+                    pattern_str = str(lora_target)
+                self.lora_target_regex = re.compile(pattern_str)
             except re.error:
                 from ..utils.logging import warning
 
@@ -163,7 +167,7 @@ class BaseLearnedConverter(ABC):
         Heuristics:
         1. Explicitly enabled via self.extract_lora.
         2. Key matches lora_target_regex (if provided).
-        3. Block index < lora_depth (e.g. .0. blocks).
+        3. Block index < lora_depth (e.g. .0. blocks). lora_depth <= 0 or -1 means unlimited depth.
         4. Sensitive layers (qkv, proj, attn) that are not too skewed.
         """
         if not self.extract_lora:
@@ -184,8 +188,8 @@ class BaseLearnedConverter(ABC):
                 block_idx = int(block_match.group(1))
 
         if block_idx != -1:
-            # Global Depth Limit: depth=1 targets only block 0
-            if block_idx >= self.lora_depth:
+            # Global Depth Limit: if lora_depth > 0, block_idx must be < lora_depth
+            if self.lora_depth > 0 and block_idx >= self.lora_depth:
                 return False
 
             # Calculate Aspect Ratio
@@ -246,7 +250,7 @@ class BaseLearnedConverter(ABC):
 
                 # LoRA Up = U * diag(S)
                 # LoRA Down = V^T
-                # Return as float16 CPU tensors for storage efficiency
+                # Return as float32 CPU tensors
                 return {
                     "lora_up": (U @ torch.diag(S)).to(torch.float32).cpu().contiguous(),
                     "lora_down": V.t().to(torch.float32).cpu().contiguous()
@@ -279,7 +283,10 @@ class BaseLearnedConverter(ABC):
         if self.full_matrix:
             if verbose:
                 debug("    - Using torch.linalg.svd with full_matrices=True")
-            U, _, Vh = torch.linalg.svd(W_float32, full_matrices=True, driver="gesvd")
+            if W_float32.device.type == "cpu":
+                U, _, Vh = torch.linalg.svd(W_float32, full_matrices=True, driver="gesvd")
+            else:
+                U, _, Vh = torch.linalg.svd(W_float32, full_matrices=True)
         else:
             try:
                 if verbose:
