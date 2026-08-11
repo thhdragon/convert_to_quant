@@ -11,34 +11,35 @@ with group-wise rotation to avoid row-wise outlier amplification.
 # INT4 W4A4 ConvRot functions are included for full parity with INT8 ConvRot.
 
 import torch
-from scipy.linalg import hadamard as scipy_hadamard
 
 # Cache Hadamard matrices by (size, device, dtype) to avoid recomputation
 _HADAMARD_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
 
 
 def pack_int4_row_major(x: torch.Tensor) -> torch.Tensor:
-    """Pack signed int4 values [-7, 7] into int8 bytes (2 values per byte)."""
-    low = x[..., 0::2].to(torch.uint8) & 0x0F
-    high = (x[..., 1::2].to(torch.uint8) & 0x0F) << 4
-    return (low | high).to(torch.int8)
+    """Pack signed int4 values [-7, 7] into int8 bytes (2 values per byte).
+
+    Uses int32 intermediates (matching comfy_kitchen reference) for safe
+    bitwise operations across all PyTorch versions and platforms.
+    """
+    lo = x[..., 0::2].to(torch.int32) & 0x0F
+    hi = x[..., 1::2].to(torch.int32) & 0x0F
+    return (lo | (hi << 4)).to(torch.int8)
 
 
 def unpack_int4_row_major(packed: torch.Tensor) -> torch.Tensor:
-    """Unpack int8 bytes into signed int4 values stored in int8 [-7, 7]."""
-    u = packed.to(torch.uint8)
-    low = (u & 0x0F).to(torch.int8)
-    low = torch.where(low >= 8, low - 16, low)
-    high = ((u >> 4) & 0x0F).to(torch.int8)
-    high = torch.where(high >= 8, high - 16, high)
+    """Unpack int8 bytes into signed int4 values stored in int8 [-7, 7].
 
-    orig_shape = packed.shape
-    rows = orig_shape[:-1]
-    cols = orig_shape[-1] * 2
-    unpacked = torch.empty((*rows, cols), dtype=torch.int8, device=packed.device)
-    unpacked[..., 0::2] = low
-    unpacked[..., 1::2] = high
-    return unpacked
+    Uses int32 intermediates and torch.stack+reshape (matching comfy_kitchen
+    reference) for correct sign-extension and safe bitwise operations.
+    """
+    x32 = packed.to(torch.int32)
+    lo = x32 & 0x0F
+    hi = (x32 >> 4) & 0x0F
+    lo = torch.where(lo >= 8, lo - 16, lo)
+    hi = torch.where(hi >= 8, hi - 16, hi)
+    stacked = torch.stack([lo, hi], dim=-1)
+    return stacked.reshape(*packed.shape[:-1], -1).to(torch.int8)
 
 
 def quantize_convrot_w4a4_weight(
@@ -103,16 +104,13 @@ def build_hadamard(
     if cache_key in _HADAMARD_CACHE:
         return _HADAMARD_CACHE[cache_key]
 
-    if size < 4 or (size & (size - 1)) != 0:
-        raise ValueError(f"Hadamard size must be a power of 2, got {size}")
-
-    # Standard Sylvester Hadamard fallback for non-power-of-4 sizes (e.g. 512)
-    is_power_of_4 = (math.log(size, 4) % 1 == 0)
-    if not is_power_of_4:
-        H_np = scipy_hadamard(size)
-        H_normalized = torch.from_numpy(H_np).to(device=device, dtype=dtype) / (size**0.5)
-        _HADAMARD_CACHE[cache_key] = H_normalized
-        return H_normalized
+    if size < 4 or (size & (size - 1)) != 0 or math.log(size, 4) % 1 != 0:
+        raise ValueError(
+            f"ConvRot Hadamard size must be a power of 4 (e.g. 4, 16, 64, 256, 1024), got {size}. "
+            f"The standard Sylvester Hadamard fallback was removed because it has an all-ones DC "
+            f"column that amplifies row-wise outliers in diffusion models. "
+            f"Use a convrot_group_size that is a power of 4, or disable ConvRot for this layer."
+        )
 
     # Base H4 from Theorem 3.3 (Eq 9 in the paper)
     # Notice how every row and column sums to exactly 2

@@ -21,7 +21,7 @@ from ..constants import (
     TARGET_INT8_DTYPE,
 )
 from ..pinned_transfer import transfer_to_gpu_pinned
-from ..utils.logging import debug, info, verbose
+from ..utils.logging import debug, info, verbose, warning
 from .base_converter import BaseLearnedConverter
 
 
@@ -1039,19 +1039,19 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                         W_float32, qdata, scale, X_rot, Y_ref
                     )
 
-                    # Scale Re-Estimation
-                    info("    - Scale Optimization: Re-estimating scales based on Pass 1 output...")
-                    dequant_opt = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE) * scale.unsqueeze(
-                        1
-                    )
-                    row_max_opt = dequant_opt.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+                    # Scale Re-Estimation: derive new scale from original float weights,
+                    # not from the dequantized output. Using dequant output would produce
+                    # scale_new <= scale_old (since int4 values are already <=7), which
+                    # defeats the purpose of DUALROUND.
+                    info("    - Scale Optimization: Re-estimating scales based on original weights...")
+                    row_max_opt = W_float32.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
                     scale = (row_max_opt / 7.0).squeeze(1)
                     scaled_int8 = (
                         (W_float32 / scale.unsqueeze(1)).round().clamp(-7, 7).to(torch.int8)
                     )
                     qdata = pack_int4_row_major(scaled_int8)
 
-                    del dequant_opt, row_max_opt
+                    del row_max_opt
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1064,6 +1064,14 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     qdata, scale = self._optimize_int4_adaround(
                         W_float32, qdata, scale, X_rot, Y_ref
                     )
+            else:
+                warning(
+                    "    - WARNING: INT4 learned rounding requested (no_learned_rounding=False, "
+                    f"num_iter={self.num_iter}) but will be skipped: ConvRot is "
+                    + ("disabled" if not self.convrot else "not applied (incompatible in_features)")
+                    + " or calibration data is unavailable (X_rot is None). "
+                    "Pass calibration_data and ensure in_features is divisible by convrot_group_size."
+                )
 
         dequantized_rot = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE) * scale.unsqueeze(1)
         if convrot_applied and layer_group_size is not None:
@@ -1085,13 +1093,20 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             with torch.no_grad():
                 if self.w4a4_untouched_activations:
                     act_dequant = X_rot
+                    # Reference is unquantized acts × unquantized weights: Y_ref is correct as-is.
+                    Y_ref_bias = Y_ref
                 else:
                     qact, x_scales = quantize_signed_int4_rowwise(X_rot)
                     act_dequant = (
                         unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
                     )
+                    # Use consistent reference: quantized acts × original (unquantized) rotated weights.
+                    # This measures only weight quantization error, matching what the runtime kernel sees.
+                    # Using Y_ref (unquantized acts × unquantized weights) here would cause the bias
+                    # to absorb activation quantization error as well, leading to over-correction.
+                    Y_ref_bias = act_dequant @ W_float32.T
                 Y_quant = act_dequant @ dequantized_rot.T
-                bias_adj = (Y_ref - Y_quant).mean(dim=0)
+                bias_adj = (Y_ref_bias - Y_quant).mean(dim=0)
                 self._current_extra_tensors["bias_correction"] = bias_adj.cpu()
                 info(
                     f"    - Phase 4: Residual Bias Calibration for INT4 (bias correction norm: {bias_adj.norm().item():.6f})"
@@ -1378,9 +1393,13 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         )
 
         with torch.no_grad():
-            best_V.sigmoid_().ge_(0.5)
-            W_floor.add_(best_V).clamp_(-7, 7)
-            opt_qdata = pack_int4_row_major(W_floor.to(torch.int8))
+            # Use out-of-place ops to avoid corrupting W_floor (used by DUALROUND).
+            # sigmoid + ge gives {0.0, 1.0}; add to floor, clamp, round, then pack.
+            # round() is required before to(int8): truncation would silently mis-quantize
+            # values like 6.9999 -> 6 instead of 7.
+            best_V_binary = best_V.sigmoid().ge(0.5).float()
+            W_quant = (W_floor + best_V_binary).clamp(-7, 7)
+            opt_qdata = pack_int4_row_major(W_quant.round().to(torch.int8))
             info(
                 f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries."
             )
