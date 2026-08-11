@@ -88,7 +88,14 @@ WAN_LAYER_KEYNAMES = [
     "trainable_cond_mask", "cond_encoder", "audio_model.time_embedding", "time_projection", "video_model.time_projection",
     "head.head", "face_encoder.out_proj", "face_adapter", "audio_injector"
 ]
-QWEN_LAYER_KEYNAMES = ["time_text_embed", "img_in", "norm_out", "proj_out", "transformer_blocks.0.img_mod.1", "txt_in"]
+QWEN_LAYER_KEYNAMES = [
+    "time_text_embed",
+    "img_in",
+    "norm_out",
+    "proj_out",
+    # "transformer_blocks.0.img_mod.1",
+    "txt_in",
+]
 ERNIE_IMAGE_LAYER_KEYNAMES = [
     "time_embedding",
     "adaLN_modulation",

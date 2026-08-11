@@ -286,6 +286,13 @@ def get_parser() -> MultiHelpArgumentParser:
         help="Enable group-wise Hadamard rotation (ConvRot) with static group size 256 (dimensions < 256 copied untouched in bf16).",
     )
     parser.add_argument(
+        "--w4a4-untouched-activations",
+        "--w4a4_untouched_activations",
+        action="store_true",
+        dest="w4a4_untouched_activations",
+        help="For W4A4 ConvRot quantization, leave calibration activations untouched during weight optimization and residual bias calibration to let the W4A4 kernel quantize them on the fly.",
+    )
+    parser.add_argument(
         "--nvfp4",
         action="store_true",
         help="Use NVFP4 (FP4 E2M1) block quantization. Requires Blackwell GPU (SM >= 10.0/12.0) for inference.",
@@ -1685,6 +1692,7 @@ def run_conversion(args):
         convrot=args.convrot,
         convrot_group_size=args.convrot_group_size,
         dynamic_convrot=args.dynamic_convrot,
+        w4a4_untouched_activations=getattr(args, "w4a4_untouched_activations", False),
         # Fallback options
         fallback_block_size=args.fallback_block_size,
         fallback_simple=args.fallback_simple,

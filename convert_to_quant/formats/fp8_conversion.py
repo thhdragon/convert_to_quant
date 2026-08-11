@@ -53,6 +53,7 @@ def convert_to_fp8_scaled(
     convrot: bool = False,
     convrot_group_size: int = 256,
     dynamic_convrot: bool = False,
+    w4a4_untouched_activations: bool = False,
     fallback_block_size: Optional[int] = None,
     fallback_simple: bool = False,
     full_precision_matrix_mult: bool = False,
@@ -167,6 +168,7 @@ def convert_to_fp8_scaled(
     converter_kwargs["convrot"] = convrot
     converter_kwargs["convrot_group_size"] = convrot_group_size
     converter_kwargs["dynamic_convrot"] = dynamic_convrot
+    converter_kwargs["w4a4_untouched_activations"] = w4a4_untouched_activations
 
     # Add LoRA options to converter kwargs
     converter_kwargs["extract_lora"] = extract_lora

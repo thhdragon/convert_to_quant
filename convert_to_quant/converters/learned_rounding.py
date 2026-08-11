@@ -48,6 +48,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         convrot_group_size: int = 256,
         dynamic_convrot: bool = False,
         scale_optimization: str = "fixed",
+        w4a4_untouched_activations: bool = False,
         **kwargs,
     ):
         """Initialize FP8/INT8 converter.
@@ -80,6 +81,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         if self.dynamic_convrot:
             self.convrot = True
         self.scale_optimization = scale_optimization
+        self.w4a4_untouched_activations = w4a4_untouched_activations
         self.has_bias = True
 
         # INT8/INT4 format scaling mode defaults
@@ -1081,8 +1083,13 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             from ..comfy.int4_kernels import quantize_signed_int4_rowwise
 
             with torch.no_grad():
-                qact, x_scales = quantize_signed_int4_rowwise(X_rot)
-                act_dequant = unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
+                if self.w4a4_untouched_activations:
+                    act_dequant = X_rot
+                else:
+                    qact, x_scales = quantize_signed_int4_rowwise(X_rot)
+                    act_dequant = (
+                        unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
+                    )
                 Y_quant = act_dequant @ dequantized_rot.T
                 bias_adj = (Y_ref - Y_quant).mean(dim=0)
                 self._current_extra_tensors["bias_correction"] = bias_adj.cpu()
@@ -1112,11 +1119,16 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
         M, N = W_float32.shape
 
-        # Pre-compute row-wise INT4 quantized activations for W4A4 matmul matching runtime kernel
+        # Pre-compute row-wise INT4 quantized activations for W4A4 matmul matching runtime kernel (or leave untouched if configured)
         with torch.no_grad():
-            qact, x_scales = quantize_signed_int4_rowwise(X_rot)
-            act_dequant = unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
-            del qact, x_scales
+            if self.w4a4_untouched_activations:
+                act_dequant = X_rot
+            else:
+                qact, x_scales = quantize_signed_int4_rowwise(X_rot)
+                act_dequant = (
+                    unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
+                )
+                del qact, x_scales
 
         # 1. Compute SVD components of rotated parameter matrix
         U_k, Vh_k, k = self._compute_svd_components(W_float32, verbose=True)
@@ -1373,7 +1385,9 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 f"    - Discretization audit: {best_converged_ratio * 100:.2f}% of parameters converged to strict boundaries."
             )
 
-        self._cleanup_tensors(U_k, Vh_k, V, act_dequant)
+        if not self.w4a4_untouched_activations:
+            self._cleanup_tensors(act_dequant)
+        self._cleanup_tensors(U_k, Vh_k, V)
         return opt_qdata, scale
 
     def _convert_int8_tensorwise(

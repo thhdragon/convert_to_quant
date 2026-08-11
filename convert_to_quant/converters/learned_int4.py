@@ -21,6 +21,7 @@ class LearnedINT4Converter(LearnedRoundingConverter):
         convrot: bool = True,
         convrot_group_size: int = 256,
         dynamic_convrot: bool = False,
+        w4a4_untouched_activations: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -30,5 +31,6 @@ class LearnedINT4Converter(LearnedRoundingConverter):
             convrot=convrot,
             convrot_group_size=convrot_group_size,
             dynamic_convrot=dynamic_convrot,
+            w4a4_untouched_activations=w4a4_untouched_activations,
             **kwargs,
         )

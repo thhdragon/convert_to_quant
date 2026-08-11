@@ -169,4 +169,31 @@ def test_w4a4_adaround_quantized_activations():
     assert mse_opt <= mse_simple
 
 
+def test_w4a4_untouched_activations():
+    """Verify W4A4 ConvRot quantization when w4a4_untouched_activations=True."""
+    torch.manual_seed(42)
+    converter = LearnedINT4Converter(
+        device="cpu",
+        no_learned_rounding=False,
+        num_iter=10,
+        optimizer="adamw",
+        lr=0.5,
+        convrot=True,
+        convrot_group_size=256,
+        w4a4_untouched_activations=True,
+    )
+    weight = torch.randn(16, 256, dtype=torch.float32)
+    bias = torch.randn(16, dtype=torch.float32)
+    calib = torch.randn(32, 256, dtype=torch.float32)
+
+    qdata, scale, dequantized, extra = converter.convert(weight, bias=bias, calibration_data=calib)
+    assert qdata.shape == (16, 128)
+    assert scale.shape == (16,)
+    assert "bias_correction" in extra
+
+    # Evaluate using W4A4 linear kernel
+    out = convrot_w4a4_linear(calib, qdata, scale, bias=bias + extra["bias_correction"].to(calib.device))
+    assert out.shape == (32, 16)
+
+
 
