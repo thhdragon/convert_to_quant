@@ -7,6 +7,7 @@ from .int4_conversion import convert_int4_to_comfy_quant
 from .int8_conversion import convert_int8_to_comfy_quant
 from .legacy_utils import add_legacy_input_scale, cleanup_fp8_scaled
 from .nvfp4_conversion import convert_to_nvfp4
+from .w4a8_int8_conversion import convert_to_w4a8_int8, convert_w4a8_int8_to_comfy_quant
 
 __all__ = [
     "dequantize_model",
@@ -18,6 +19,8 @@ __all__ = [
     "add_legacy_input_scale",
     "cleanup_fp8_scaled",
     "convert_to_nvfp4",
+    "convert_to_w4a8_int8",
+    "convert_w4a8_int8_to_comfy_quant",
 ]
 
 

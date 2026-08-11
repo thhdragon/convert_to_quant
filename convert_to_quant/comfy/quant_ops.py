@@ -1001,6 +1001,112 @@ class TensorCoreConvRotW4A4Layout(QuantizedLayout):
         return qtensor._qdata, qtensor._layout_params["scale"]
 
 
+class AsymW4A8Int8Layout(QuantizedLayout):
+    """
+    AsymW4A8Int8Layout: Grouped W4A8 INT8 quantization layout with ConvRot Hadamard rotation.
+
+    Storage format:
+    - qdata: INT8 packed 4-bit tensor [N, K // 2]
+    - s_rel (scale): Per-group relative scale [N, K // group_size]
+    - s_channel: Per-channel scale [N]
+    - correction: Optional zero-point correction [groups, N]
+    - codebook: Optional 16-entry Lloyd-Max codebook [16]
+    """
+
+    @classmethod
+    def quantize(
+        cls,
+        tensor: torch.Tensor,
+        group_size: int = 16,
+        convrot_groupsize: int = 256,
+        symmetric: bool = True,
+        scale_dtype: torch.dtype = torch.float8_e4m3fn,
+        codebook: bool = True,
+        codebook_tensor: torch.Tensor | None = None,
+        stochastic_rounding: int = 0,
+        **kwargs,
+    ):
+        try:
+            from comfy_kitchen.tensor.w4a8_int8 import quantize_w4a8_int8_weight
+            qdata, s_rel, s_channel, correction, codebook_out = quantize_w4a8_int8_weight(
+                tensor,
+                group_size=group_size,
+                convrot_groupsize=convrot_groupsize,
+                symmetric=symmetric,
+                scale_dtype=scale_dtype,
+                codebook=codebook,
+                codebook_tensor=codebook_tensor,
+                stochastic_rounding=stochastic_rounding,
+            )
+        except Exception:
+            from ..converters.w4a8_int8_converter import quantize_w4a8_int8_pytorch
+            qdata, s_rel, s_channel, correction, codebook_out = quantize_w4a8_int8_pytorch(
+                tensor,
+                group_size=group_size,
+                convrot_groupsize=convrot_groupsize,
+                symmetric=symmetric,
+                scale_dtype=scale_dtype,
+                codebook=codebook,
+            )
+
+        layout_params = {
+            "scale": s_rel,
+            "s_channel": s_channel,
+            "correction": correction,
+            "codebook": codebook_out,
+            "group_size": group_size,
+            "convrot_groupsize": convrot_groupsize,
+            "orig_dtype": tensor.dtype,
+        }
+        return qdata, layout_params
+
+    @staticmethod
+    def dequantize(
+        qdata: torch.Tensor,
+        s_rel: torch.Tensor | None = None,
+        scale: torch.Tensor | None = None,
+        s_channel: torch.Tensor | None = None,
+        codebook: torch.Tensor | None = None,
+        correction: torch.Tensor | None = None,
+        group_size: int = 16,
+        convrot_groupsize: int = 256,
+        orig_dtype: torch.dtype = torch.bfloat16,
+        output_dtype: torch.dtype | None = None,
+        **kwargs,
+    ):
+        target_dtype = output_dtype or orig_dtype or torch.bfloat16
+        rel_scale = s_rel if s_rel is not None else scale
+        try:
+            from comfy_kitchen.tensor.w4a8_int8 import dequantize_w4a8_int8_weight
+            return dequantize_w4a8_int8_weight(
+                qdata,
+                rel_scale,
+                s_channel,
+                codebook=codebook,
+                correction=correction,
+                group_size=group_size,
+                convrot_groupsize=convrot_groupsize,
+                output_dtype=target_dtype,
+            )
+        except Exception:
+            from ..converters.w4a8_int8_converter import dequantize_w4a8_int8_pytorch
+            return dequantize_w4a8_int8_pytorch(
+                qdata,
+                rel_scale,
+                s_channel,
+                codebook=codebook,
+                correction=correction,
+                group_size=group_size,
+                convrot_groupsize=convrot_groupsize,
+                output_dtype=target_dtype,
+            )
+
+    @classmethod
+    def get_plain_tensors(cls, qtensor):
+        p = qtensor._layout_params
+        return qtensor._qdata, p["scale"], p["s_channel"], p.get("correction"), p.get("codebook")
+
+
 # Note: group_size here is a fallback if per-tensor .comfy_quant metadata doesn't specify it.
 # Prefer always storing group_size in per-tensor metadata during conversion.
 QUANT_ALGOS = {
@@ -1026,6 +1132,24 @@ QUANT_ALGOS = {
         "comfy_tensor_layout": "TensorCoreConvRotW4A4Layout",
         "group_size": 64,
     },
+    "w4a8_int8": {
+        "storage_t": torch.int8,
+        "parameters": {"weight_scale", "_s_rel", "_s_channel", "_correction", "_codebook"},
+        "comfy_tensor_layout": "AsymW4A8Int8Layout",
+        "group_size": 16,
+    },
+    "asym_w4a8_int8": {
+        "storage_t": torch.int8,
+        "parameters": {"weight_scale", "_s_rel", "_s_channel", "_correction", "_codebook"},
+        "comfy_tensor_layout": "AsymW4A8Int8Layout",
+        "group_size": 16,
+    },
+    "w4a8": {
+        "storage_t": torch.int8,
+        "parameters": {"weight_scale", "_s_rel", "_s_channel", "_correction", "_codebook"},
+        "comfy_tensor_layout": "AsymW4A8Int8Layout",
+        "group_size": 16,
+    },
 }
 
 LAYOUTS = {
@@ -1035,6 +1159,7 @@ LAYOUTS = {
     "BlockWiseINT8Layout": BlockWiseINT8Layout,
     "TensorWiseINT8Layout": TensorWiseINT8Layout,
     "TensorCoreConvRotW4A4Layout": TensorCoreConvRotW4A4Layout,
+    "AsymW4A8Int8Layout": AsymW4A8Int8Layout,
 }
 
 

@@ -48,10 +48,18 @@ from .constants import (  # New registry
 )
 
 # Re-export converters
-from .converters import LearnedINT4Converter, LearnedRoundingConverter
+from .converters import LearnedINT4Converter, LearnedRoundingConverter, LearnedW4A8Int8Converter, W4A8Int8Converter
 
 # Re-export formats
-from .formats import add_legacy_input_scale, cleanup_fp8_scaled, convert_fp8_scaled_to_comfy_quant, convert_int4_to_comfy_quant, convert_int8_to_comfy_quant, convert_to_fp8_scaled
+from .formats import (
+    add_legacy_input_scale,
+    cleanup_fp8_scaled,
+    convert_fp8_scaled_to_comfy_quant,
+    convert_int4_to_comfy_quant,
+    convert_int8_to_comfy_quant,
+    convert_to_fp8_scaled,
+    convert_to_w4a8_int8,
+)
 
 
 # Re-export utils

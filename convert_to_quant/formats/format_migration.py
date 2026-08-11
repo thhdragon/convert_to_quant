@@ -509,12 +509,17 @@ def scan_and_replace_comfy_quant_metadata(
             convrot_gs: Optional[int] = convrot_group_size if convrot else None
             per_row: Optional[bool] = None
 
-            # Detect ConvRot / INT4 indicators
+            # Detect ConvRot / INT4 / W4A8 indicators
             is_convrot_layer = int4 or convrot or header_is_convrot
+            is_w4a8_layer = False
             if existing_config:
                 existing_fmt = str(existing_config.get("format", "")).lower()
                 if existing_fmt in ("convrot_w4a4", "int4_convrot", "int4", "int4_blockwise", "w4a4") or existing_config.get("convrot") is True:
                     is_convrot_layer = True
+                elif existing_fmt in ("w4a8_int8", "asym_w4a8_int8", "w4a8", "asymw4a8int8layout"):
+                    is_w4a8_layer = True
+            elif data.get("_s_rel") is not None and data.get("_s_channel") is not None:
+                is_w4a8_layer = True
 
             if existing_config:
                 format_type = existing_config.get("format", format_type)
@@ -528,7 +533,13 @@ def scan_and_replace_comfy_quant_metadata(
 
             M, N = weight.shape[0], weight.shape[1] if weight.ndim >= 2 else 1
 
-            if is_convrot_layer and is_integer:
+            if is_w4a8_layer:
+                format_type = "w4a8_int8"
+                convrot_flag = True
+                convrot_gs = convrot_gs or convrot_group_size
+                if block_size is None:
+                    block_size = default_block_size if default_block_size is not None else 16
+            elif is_convrot_layer and is_integer:
                 format_type = "convrot_w4a4" if format_type not in ("convrot_w4a4", "int4_convrot") else format_type
                 convrot_flag = True
                 convrot_gs = convrot_gs or convrot_group_size
@@ -584,8 +595,8 @@ def scan_and_replace_comfy_quant_metadata(
                         block_size = fallback_bs
 
             # Ensure block-based formats have group_size set
-            if format_type in ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4", "int4_convrot") and block_size is None:
-                block_size = default_block_size if default_block_size is not None else (64 if format_type in ("convrot_w4a4", "int4_convrot") else 128)
+            if format_type in ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4", "int4_convrot", "w4a8_int8") and block_size is None:
+                block_size = default_block_size if default_block_size is not None else (16 if format_type == "w4a8_int8" else (64 if format_type in ("convrot_w4a4", "int4_convrot") else 128))
 
             # Create updated .comfy_quant tensor
             comfy_quant_tensor = create_comfy_quant_tensor(
@@ -595,6 +606,9 @@ def scan_and_replace_comfy_quant_metadata(
                 convrot=convrot_flag,
                 convrot_groupsize=convrot_gs,
                 per_row=per_row,
+                scale_dtype=existing_config.get("scale_dtype") if existing_config else None,
+                symmetric=existing_config.get("symmetric") if existing_config else None,
+                codebook=existing_config.get("codebook") if existing_config else None,
             )
             output_tensors[f"{base_name}.comfy_quant"] = comfy_quant_tensor
 

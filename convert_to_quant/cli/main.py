@@ -27,6 +27,7 @@ from ..formats.int8_conversion import convert_int8_to_comfy_quant
 from ..formats.legacy_utils import add_legacy_input_scale, cleanup_fp8_scaled
 from ..formats.mxfp8_conversion import convert_to_mxfp8
 from ..formats.nvfp4_conversion import convert_to_nvfp4
+from ..formats.w4a8_int8_conversion import convert_to_w4a8_int8
 from ..pinned_transfer import set_verbose as set_pinned_verbose
 from ..utils.comfy_quant import edit_comfy_quant
 from ..utils.parallel_utils import parse_devices
@@ -103,6 +104,8 @@ def analyze_dry_run(args) -> None:
 
     if getattr(args, "int4", False):
         primary_format = "int4"
+    elif getattr(args, "w4a8_int8", False):
+        primary_format = "w4a8_int8"
     elif args.nvfp4:
         primary_format = "nvfp4"
     elif args.mxfp8:
@@ -303,6 +306,14 @@ def get_parser() -> MultiHelpArgumentParser:
         help="Use MXFP8 (Microscaling FP8) block quantization. Requires Blackwell GPU (SM >= 10.0) for inference.",
     )
     parser.add_argument(
+        "--w4a8-int8",
+        "--w4a8_int8",
+        "--w4a8",
+        action="store_true",
+        dest="w4a8_int8",
+        help="Use W4A8 INT8 grouped quantization format (AsymW4A8Int8Layout).",
+    )
+    parser.add_argument(
         "--make-hybrid-mxfp8",
         "--make_hybrid_mxfp8",
         action="store_true",
@@ -321,7 +332,7 @@ def get_parser() -> MultiHelpArgumentParser:
         "--fallback",
         type=str,
         default=None,
-        choices=["fp8", "int8", "mxfp8", "nvfp4"],
+        choices=["fp8", "int8", "mxfp8", "nvfp4", "w4a8_int8"],
         help="Fallback quantization type for excluded layers (instead of keeping original precision).",
     )
     parser.add_argument(
@@ -346,7 +357,7 @@ def get_parser() -> MultiHelpArgumentParser:
         type=str,
         default=None,
         dest="custom_type",
-        choices=["fp8", "int8", "mxfp8", "nvfp4"],
+        choices=["fp8", "int8", "mxfp8", "nvfp4", "w4a8_int8"],
         help="Quantization type for custom layer matches.",
     )
     # Custom-type parameter overrides
@@ -1390,6 +1401,47 @@ def run_conversion(args):
                 lora_depth=args.lora_depth,
                 lora_ar_threshold=args.lora_ar_threshold,
                 lora_output=args.lora_output,
+            )
+            return
+
+    # Handle W4A8 INT8 quantization mode (dedicated workflow)
+    if getattr(args, "w4a8_int8", False):
+        needs_mixing = args.custom_type or args.fallback or args.layer_config
+        if needs_mixing:
+            print("W4A8 INT8 with custom/fallback: using unified quantization path")
+            if not args.output:
+                base = os.path.splitext(args.input)[0]
+                args.output = f"{base}_w4a8_int8_mixed.safetensors"
+            args.int8 = False
+        else:
+            if not args.output:
+                base = os.path.splitext(args.input)[0]
+                prefix = "simple_" if args.simple else "learned_"
+                filter_flags = extract_filter_flags(args)
+                has_filters = any(filter_flags.values())
+                has_custom = bool(args.custom_layers)
+                mixed_suffix = "mixed" if (has_filters or has_custom) else ""
+                args.output = f"{base}_{prefix}w4a8_int8{mixed_suffix}.safetensors"
+
+            if not os.path.exists(args.input):
+                print(f"Error: Input file not found: {args.input}")
+                return
+
+            if os.path.abspath(args.input) == os.path.abspath(args.output):
+                print("Error: Output file cannot be same as input.")
+                return
+
+            filter_flags = extract_filter_flags(args)
+            convert_to_w4a8_int8(
+                args.input,
+                args.output,
+                filter_flags=filter_flags,
+                exclude_layers=args.exclude_layers,
+                simple=args.simple,
+                group_size=args.block_size or 16,
+                convrot_group_size=args.convrot_group_size,
+                low_memory=args.low_memory,
+                devices=target_devices,
             )
             return
 

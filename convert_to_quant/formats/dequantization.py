@@ -93,6 +93,10 @@ def dequantize_model(
         ".input_scale",
         ".scale_input",
         ".per_tensor_scale",
+        "._s_rel",
+        "._s_channel",
+        "._correction",
+        "._codebook",
     )
 
     for key, tensor in tensors.items():
@@ -124,7 +128,7 @@ def dequantize_model(
         weight_scale = (
             data.get("weight_scale")
             if data.get("weight_scale") is not None
-            else data.get("scale_weight")
+            else (data.get("scale_weight") if data.get("scale_weight") is not None else data.get("_s_rel"))
         )
         per_tensor_scale = data.get("per_tensor_scale")
 
@@ -138,6 +142,10 @@ def dequantize_model(
                     "input_scale",
                     "scale_input",
                     "per_tensor_scale",
+                    "_s_rel",
+                    "_s_channel",
+                    "_correction",
+                    "_codebook",
                 ):
                     if sub_v.is_floating_point():
                         output_tensors[f"{base_name}.{sub_k}"] = sub_v.to(target_dtype)
@@ -192,6 +200,26 @@ def dequantize_model(
                             weight_scale,
                             convrot_groupsize=c_gs,
                             quant_group_size=bs,
+                            output_dtype=target_dtype,
+                        )
+                elif fmt in ("w4a8_int8", "asym_w4a8_int8", "w4a8", "AsymW4A8Int8Layout"):
+                    s_rel = weight_scale
+                    s_channel = data.get("_s_channel")
+                    codebook = data.get("_codebook")
+                    correction = data.get("_correction")
+                    if s_rel is not None and s_channel is not None:
+                        bs = group_size or 16
+                        c_gs = convrot_groupsize or 256
+                        from ..converters.w4a8_int8_converter import dequantize_w4a8_int8_pytorch
+
+                        dequantized_weight = dequantize_w4a8_int8_pytorch(
+                            weight,
+                            s_rel,
+                            s_channel,
+                            codebook=codebook,
+                            correction=correction,
+                            group_size=bs,
+                            convrot_groupsize=c_gs,
                             output_dtype=target_dtype,
                         )
                 elif fmt == "nvfp4":

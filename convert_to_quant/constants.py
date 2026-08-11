@@ -385,6 +385,11 @@ MXFP8_BLOCK_SIZE = 32  # MXFP8 uses 32-element blocks
 MXFP8_DTYPE = torch.float8_e4m3fn  # Data stored as FP8 E4M3
 E8M0_BIAS = 127  # Exponent bias for E8M0 format (value = 2^(exp - 127))
 
+# W4A8 INT8 constants (AsymW4A8Int8Layout)
+W4A8_GROUP_SIZE = 16
+W4A8_CONVROT_GROUPSIZE = 256
+W4A8_SCALE_DTYPE = torch.float8_e4m3fn
+
 # --- Adaptive LR Tier Configuration ---
 # Used by 'original' optimizer in LearnedRoundingConverter and LearnedNVFP4Converter.
 # Format: List of (counter_threshold, improvement_mult, decay_mult, min_lr)
@@ -430,6 +435,7 @@ VALID_QUANT_FORMATS = {
     "nvfp4",  # NVIDIA FP4 E2M1 block quantization
     "mxfp8",  # Microscaling FP8 block quantization
     "hybrid_mxfp8",  # Hybrid MXFP8 (MXFP8 + tensorwise fallback)
+    "w4a8_int8",  # Grouped W4A8 INT8 (AsymW4A8Int8Layout)
 }
 
 # Global config: normalize 1-element scale arrays to scalars (set from CLI)

@@ -18,22 +18,44 @@ from .logging import error, info, minimal, verbose, warning
 from .tensor_utils import dict_to_tensor, normalize_tensorwise_scales, tensor_to_dict
 
 # Block-based formats that require group_size
-BLOCK_BASED_FORMATS = ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4", "int4_convrot", "int4_blockwise")
+BLOCK_BASED_FORMATS = (
+    "int8_blockwise",
+    "float8_e4m3fn_blockwise",
+    "convrot_w4a4",
+    "int4_convrot",
+    "int4_blockwise",
+    "w4a8_int8",
+    "asym_w4a8_int8",
+    "w4a8",
+    "AsymW4A8Int8Layout",
+)
 
 
-
-def create_comfy_quant_tensor(format_type: str, block_size: Optional[int] = None, full_precision_matrix_mult: Optional[bool] = None, convrot: Optional[bool] = None, convrot_groupsize: Optional[int] = None, per_row: Optional[bool] = None) -> torch.Tensor:
+def create_comfy_quant_tensor(
+    format_type: str,
+    block_size: Optional[int] = None,
+    full_precision_matrix_mult: Optional[bool] = None,
+    convrot: Optional[bool] = None,
+    convrot_groupsize: Optional[int] = None,
+    per_row: Optional[bool] = None,
+    scale_dtype: Optional[str] = None,
+    symmetric: Optional[bool] = None,
+    codebook: Optional[bool] = None,
+) -> torch.Tensor:
     """
     Create a .comfy_quant layer configuration tensor for ComfyUI.
 
     Args:
         format_type: One of "float8_e4m3fn", "float8_e4m3fn_rowwise", "float8_e4m3fn_blockwise",
-                     "int8_tensorwise", or "int8_blockwise"
+                     "int8_tensorwise", "int8_blockwise", or "w4a8_int8"
         block_size: Block/group size for quantization (for block-based formats)
         full_precision_matrix_mult: If True, adds "full_precision_matrix_mult": True.
-                                    If False or None, this key is omitted.
         convrot: If True, adds "convrot": True.
         convrot_groupsize: Group size used for ConvRot, if applied.
+        per_row: If True, adds "per_row": True.
+        scale_dtype: String representation of scale dtype (e.g. "float8_e4m3fn") for w4a8_int8.
+        symmetric: If specified, adds "symmetric": bool for w4a8_int8.
+        codebook: If specified, adds "codebook": bool for w4a8_int8.
 
     Returns:
         torch.uint8 tensor containing JSON-encoded layer configuration
@@ -51,9 +73,20 @@ def create_comfy_quant_tensor(format_type: str, block_size: Optional[int] = None
         comfy_quant["convrot"] = True
         if convrot_groupsize is not None:
             comfy_quant["convrot_groupsize"] = convrot_groupsize
+    elif convrot_groupsize is not None:
+        comfy_quant["convrot_groupsize"] = convrot_groupsize
 
     if per_row is True:
         comfy_quant["per_row"] = True
+
+    if scale_dtype is not None:
+        comfy_quant["scale_dtype"] = str(scale_dtype)
+
+    if symmetric is not None:
+        comfy_quant["symmetric"] = symmetric
+
+    if codebook is not None:
+        comfy_quant["codebook"] = codebook
 
     return dict_to_tensor(comfy_quant)
 

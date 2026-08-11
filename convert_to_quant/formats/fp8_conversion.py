@@ -214,6 +214,13 @@ def convert_to_fp8_scaled(
             # NVFP4 has fixed block_size=16, remove incompatible kwargs
             nvfp4_kwargs = {k: v for k, v in kwargs.items() if k not in ("target_format", "scaling_mode", "block_size")}
             return LearnedNVFP4Converter(**nvfp4_kwargs)
+        elif fmt in ("w4a8_int8", "asym_w4a8_int8", "w4a8"):
+            from ..converters.w4a8_int8_converter import LearnedW4A8Int8Converter
+
+            w4a8_kwargs = {k: v for k, v in kwargs.items() if k not in ("target_format", "scaling_mode")}
+            if "block_size" in w4a8_kwargs:
+                w4a8_kwargs["group_size"] = w4a8_kwargs.pop("block_size")
+            return LearnedW4A8Int8Converter(**w4a8_kwargs)
         elif fmt in ("int4", "convrot_w4a4"):
             int4_kwargs = kwargs.copy()
             int4_kwargs["target_format"] = "int4"
@@ -230,6 +237,9 @@ def convert_to_fp8_scaled(
             "int8": {"dtype": TARGET_INT8_DTYPE, "name": "INT8"},
             "int4": {"dtype": TARGET_INT8_DTYPE, "name": "INT4 ConvRot W4A4"},
             "convrot_w4a4": {"dtype": TARGET_INT8_DTYPE, "name": "INT4 ConvRot W4A4"},
+            "w4a8_int8": {"dtype": TARGET_INT8_DTYPE, "name": "W4A8 INT8 (AsymW4A8Int8Layout)"},
+            "asym_w4a8_int8": {"dtype": TARGET_INT8_DTYPE, "name": "W4A8 INT8 (AsymW4A8Int8Layout)"},
+            "w4a8": {"dtype": TARGET_INT8_DTYPE, "name": "W4A8 INT8 (AsymW4A8Int8Layout)"},
             "fp8": {"dtype": TARGET_FP8_DTYPE, "name": "FP8"},
             "mxfp8": {"dtype": torch.uint8, "name": "MXFP8"},
             "nvfp4": {"dtype": torch.uint8, "name": "NVFP4"},
@@ -377,6 +387,8 @@ def convert_to_fp8_scaled(
                     layer_format = "mxfp8"
                 elif fmt == "nvfp4":
                     layer_format = "nvfp4"
+                elif fmt in ("w4a8_int8", "asym_w4a8_int8", "w4a8"):
+                    layer_format = "w4a8_int8"
                 elif fmt in ("int4", "convrot_w4a4"):
                     layer_format = "convrot_w4a4"
                 else:
@@ -461,6 +473,7 @@ def convert_to_fp8_scaled(
         is_int8 = layer_format == "int8"
         is_mxfp8 = layer_format == "mxfp8"
         is_nvfp4 = layer_format == "nvfp4"
+        is_w4a8 = layer_format in ("w4a8_int8", "asym_w4a8_int8", "w4a8")
         is_int4 = layer_format in ("int4", "convrot_w4a4")
 
         depth = -1
@@ -495,7 +508,10 @@ def convert_to_fp8_scaled(
         res_tensors = {}
         res_lora = {}
 
-        if is_mxfp8:
+        if is_w4a8:
+            q_tensor, s_rel, s_channel, correction, codebook, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, has_bias=has_bias)
+            dequant_s = s_rel
+        elif is_mxfp8:
             q_tensor, block_scales, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, has_bias=has_bias)
             dequant_s = block_scales
         elif is_nvfp4:
@@ -541,7 +557,7 @@ def convert_to_fp8_scaled(
         bias_key = f"{base_name}.bias"
 
         if comfy_quant is True:
-            layer_block_size = converter.block_size
+            layer_block_size = getattr(converter, "group_size", getattr(converter, "block_size", 16))
             layer_full_precision_mm = full_precision_matrix_mult
             if use_layer_config and "full_precision_matrix_mult" in layer_settings:
                 layer_full_precision_mm = layer_settings["full_precision_matrix_mult"]
@@ -551,7 +567,26 @@ def convert_to_fp8_scaled(
             comfy_quant_format = None
             block_size_for_meta = None
 
-            if is_mxfp8:
+            if is_w4a8:
+                res_tensors[f"{base_name}.weight_scale"] = s_rel.to(device="cpu")
+                res_tensors[f"{base_name}._s_channel"] = s_channel.to(device="cpu")
+                if correction is not None:
+                    res_tensors[f"{base_name}._correction"] = correction.to(device="cpu")
+                if codebook is not None:
+                    res_tensors[f"{base_name}._codebook"] = codebook.to(device="cpu")
+                comfy_quant_format = "w4a8_int8"
+                block_size_for_meta = getattr(converter, "group_size", 16)
+                comfy_quant_tensor = create_comfy_quant_tensor(
+                    "w4a8_int8",
+                    block_size=block_size_for_meta,
+                    full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None,
+                    convrot=True,
+                    convrot_groupsize=getattr(converter, "convrot_groupsize", 256),
+                    scale_dtype=str(getattr(converter, "scale_dtype", "float8_e4m3fn")),
+                    symmetric=getattr(converter, "symmetric", True),
+                    codebook=getattr(converter, "codebook", True),
+                )
+            elif is_mxfp8:
                 res_tensors[f"{base_name}.weight_scale"] = block_scales.to(device="cpu")
                 comfy_quant_format = "mxfp8"
                 block_size_for_meta = 32
