@@ -512,8 +512,41 @@ def convert_to_fp8_scaled(
         res_lora = {}
 
         if is_w4a8:
-            q_tensor, s_rel, s_channel, correction, codebook, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, has_bias=has_bias)
+            in_features = original_tensor.shape[1]
+            base_name = key[: key.rfind(".weight")]
+
+            lora_calib = None
+            if lora_key_map and base_name in lora_key_map and "lora_A" in lora_key_map[base_name]:
+                lora_A = lora_key_map[base_name]["lora_A"]
+                x_base = lora_A.to(dtype=COMPUTE_DTYPE, device="cpu")
+                gen = torch.Generator(device="cpu").manual_seed(seed)
+                n1 = torch.randn(x_base.shape, generator=gen, dtype=COMPUTE_DTYPE)
+                n2 = torch.randn(x_base.shape, generator=gen, dtype=COMPUTE_DTYPE)
+                x_calib = torch.cat([x_base, x_base + 0.1 * n1, x_base + 0.2 * n2, x_base * -1])
+                lora_calib = x_calib / x_calib.std().clamp(min=1e-6)
+
+            calib_data_loaded_w4a8 = False
+            if lora_calib is not None:
+                w4a8_calibration_data = lora_calib
+            else:
+                cache_entry = calibration_data_cache.get(in_features)
+                if isinstance(cache_entry, str):
+                    with MemoryEfficientSafeOpen(cache_entry, low_memory=True) as calib_loader:
+                        w4a8_calibration_data = calib_loader.get_tensor("calib_data")
+                    calib_data_loaded_w4a8 = True
+                else:
+                    w4a8_calibration_data = cache_entry
+
+            q_tensor, s_rel, s_channel, correction, codebook, dequant_w, extra_tensors = converter.convert(
+                original_tensor, key=key, depth=depth, has_bias=has_bias, calibration_data=w4a8_calibration_data
+            )
             dequant_s = s_rel
+
+            if calib_data_loaded_w4a8 and w4a8_calibration_data is not None:
+                del w4a8_calibration_data
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         elif is_mxfp8:
             q_tensor, block_scales, dequant_w, extra_tensors = converter.convert(original_tensor, key=key, depth=depth, has_bias=has_bias)
             dequant_s = block_scales

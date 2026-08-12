@@ -64,12 +64,11 @@ def convert_to_w4a8_int8(
 
     # Resolve scale_dtype string to actual torch.dtype
     _dtype_map = {
-        "float8_e4m3fn": torch.float8_e4m3fn,
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
-    resolved_scale_dtype = _dtype_map.get(scale_dtype, torch.float8_e4m3fn)
+    resolved_scale_dtype = _dtype_map.get(scale_dtype, torch.float32)
 
     return convert_to_fp8_scaled(
         input_file=input_file,
