@@ -1435,6 +1435,11 @@ def run_conversion(args):
             convert_to_w4a8_int8(
                 args.input,
                 args.output,
+                comfy_quant=args.comfy_quant,
+                calib_samples=args.calib_samples,
+                seed=(
+                    int(torch.randint(0, 2**32 - 1, ()).item()) if args.manual_seed == -1 else args.manual_seed
+                ),
                 filter_flags=filter_flags,
                 exclude_layers=args.exclude_layers,
                 simple=args.simple,

@@ -24,6 +24,9 @@ from .fp8_conversion import convert_to_fp8_scaled
 def convert_to_w4a8_int8(
     input_file: str,
     output_file: str,
+    comfy_quant: bool = True,
+    calib_samples: int = 8192,
+    seed: int = -1,
     filter_flags: Optional[Dict[str, bool]] = None,
     exclude_layers: Optional[str] = None,
     simple: bool = False,
@@ -41,6 +44,9 @@ def convert_to_w4a8_int8(
     Args:
         input_file: Path to input safetensors file
         output_file: Path to output safetensors file
+        comfy_quant: Enable comfy_quant metadata tensors (default True)
+        calib_samples: Number of random calibration samples for bias correction (default 3072)
+        seed: Random seed for calibration data; -1 for a random seed
         filter_flags: Filter flags dict (model exclusions)
         exclude_layers: Regex pattern for layer exclusions
         simple: Skip iterative optimization
@@ -51,9 +57,17 @@ def convert_to_w4a8_int8(
         codebook: Use Lloyd-Max codebook
         low_memory: Memory-efficient loading mode
     """
+    import torch
+
+    if seed == -1:
+        seed = int(torch.randint(0, 2**32 - 1, ()).item())
+
     return convert_to_fp8_scaled(
         input_file=input_file,
         output_file=output_file,
+        comfy_quant=comfy_quant,
+        calib_samples=calib_samples,
+        seed=seed,
         primary_format="w4a8_int8",
         filter_flags=filter_flags,
         exclude_layers=exclude_layers,
