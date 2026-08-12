@@ -108,6 +108,11 @@ def convert_to_nvfp4(
     # Device options
     device: Optional[str] = None,
     devices: Optional[Union[str, List[str]]] = None,
+    # Checkpointing options
+    resume: bool = False,
+    sidecar_path: Optional[str] = None,
+    max_shard_size: Optional[Union[str, int]] = None,
+    no_checkpoint: bool = False,
 ) -> None:
     """
     Convert safetensors model to NVFP4 (FP4 E2M1) quantized format.
@@ -123,9 +128,19 @@ def convert_to_nvfp4(
     info(f"Block size: {FP4_BLOCK_SIZE}")
     info("-" * 60)
 
+    from ..utils.checkpoint import QuantCheckpointManager
     from ..utils.parallel_utils import parse_devices, run_parallel_layer_processing
 
     target_devices = parse_devices(device=device, devices=devices)
+    checkpoint_mgr = QuantCheckpointManager(
+        output_file=output_file,
+        input_file=input_file,
+        primary_format="nvfp4",
+        resume=resume,
+        sidecar_path=sidecar_path,
+        max_shard_size=max_shard_size,
+        no_checkpoint=no_checkpoint,
+    )
     seed_device = "cpu"
     seed_generator = torch.Generator(device=seed_device)
     seed_generator.manual_seed(seed)
@@ -236,6 +251,13 @@ def convert_to_nvfp4(
 
     def process_layer_item(item: Tuple[int, str], dev: str) -> Dict[str, Any]:
         i, key = item
+
+        if checkpoint_mgr.is_layer_completed(key):
+            info(f"[{dev}] ({i + 1}/{total_weights}) Skipping (loaded from sidecar checkpoint): {key}")
+            loaded_res = checkpoint_mgr.load_completed_layer(key)
+            if loaded_res is not None:
+                return loaded_res
+
         tensor = loader.get_tensor(key)
         base_key = key.rsplit(".weight", 1)[0]
         exclusion_reason = ""
@@ -349,17 +371,22 @@ def convert_to_nvfp4(
         if str(dev).startswith("cuda"):
             torch.cuda.empty_cache()
 
-        return {
+        res_item = {
+            "key": key,
             "base_key": base_key,
             "tensors": res_tensors,
             "lora_tensors": res_lora,
+            "meta_entry": meta,
             "metadata": meta,
             "skipped": False,
         }
+        checkpoint_mgr.save_layer_checkpoint(res_item)
+        return res_item
 
     layer_results = run_parallel_layer_processing(work_items, process_layer_item, target_devices)
 
     for r in layer_results:
+        checkpoint_mgr.save_layer_checkpoint(r)
         if r.get("skipped"):
             skipped_count += 1
         else:
@@ -373,40 +400,24 @@ def convert_to_nvfp4(
             quant_metadata[r["base_key"]] = r["metadata"]
 
     # Copy non-weight tensors (bias handled above, copy others)
+    passthrough_tensors: Dict[str, torch.Tensor] = {}
     for key in all_keys:
-        if key not in output_tensors:
-            output_tensors[key] = loader.get_tensor(key)
+        if key not in output_tensors and not checkpoint_mgr.is_layer_completed(key):
+            passthrough_tensors[key] = loader.get_tensor(key)
 
     # Close loader
     loader.close()
 
-    # Normalize scales if enabled
+    passthrough_tensors.update(output_tensors)
     if NORMALIZE_SCALES_ENABLED:
-        output_tensors, normalized_count = normalize_tensorwise_scales(output_tensors)
-        if normalized_count > 0:
-            print(f"Normalized {normalized_count} scale tensors to scalars")
+        passthrough_tensors, normalized_count = normalize_tensorwise_scales(passthrough_tensors)
 
-    # Save output - preserve original metadata and include quantization metadata
-    output_metadata = dict(original_metadata)
-    if quant_metadata:
-        import json
-
-        # Wrap in proper structure with format_version and layers (matching FP8)
-        full_metadata = {"format_version": "1.0", "layers": quant_metadata}
-        output_metadata["_quantization_metadata"] = json.dumps(full_metadata)
-
-    info(f"\nSaving {len(output_tensors)} tensors to {output_file}")
-
-    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-    save_file(output_tensors, output_file, metadata=output_metadata if output_metadata else None)
-
-    # Save extracted LoRA adapter if any
-    if lora_tensors:
-        if not lora_save_path:
-            lora_save_path = lora_output or output_file.replace(".safetensors", "_lora.safetensors")
-
-        info(f"Saving {len(lora_tensors)} LoRA tensors to {lora_save_path}")
-        save_file(lora_tensors, lora_save_path)
+    checkpoint_mgr.assemble_final_output(
+        passthrough_tensors=passthrough_tensors,
+        original_metadata=original_metadata,
+        lora_tensors=lora_tensors,
+        lora_save_path=lora_save_path or lora_output,
+    )
 
     info("-" * 60)
     info("Summary:")

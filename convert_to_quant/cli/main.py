@@ -250,6 +250,34 @@ def get_parser() -> MultiHelpArgumentParser:
         help="Output safetensors file path. Auto-generated if not provided.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume quantization from existing sidecar progress file if present.",
+    )
+    parser.add_argument(
+        "--sidecar-path",
+        "--sidecar_path",
+        type=str,
+        default=None,
+        dest="sidecar_path",
+        help="Custom path for the sidecar progress JSON file.",
+    )
+    parser.add_argument(
+        "--max-shard-size",
+        "--max_shard_size",
+        type=str,
+        default=None,
+        dest="max_shard_size",
+        help="Maximum size per output safetensors shard (e.g. '5GB', '2000MB').",
+    )
+    parser.add_argument(
+        "--no-checkpoint",
+        "--no_checkpoint",
+        action="store_true",
+        dest="no_checkpoint",
+        help="Disable sidecar progress tracking and per-layer checkpoint saving.",
+    )
+    parser.add_argument(
         "--comfy_quant",
         "--comfy-quant",
         action="store_true",
@@ -1285,6 +1313,11 @@ def run_conversion(args):
                 lora_depth=args.lora_depth,
                 lora_ar_threshold=args.lora_ar_threshold,
                 lora_output=args.lora_output,
+                # Checkpointing options
+                resume=args.resume,
+                sidecar_path=args.sidecar_path,
+                max_shard_size=args.max_shard_size,
+                no_checkpoint=args.no_checkpoint,
             )
             return
 
@@ -1401,6 +1434,11 @@ def run_conversion(args):
                 lora_depth=args.lora_depth,
                 lora_ar_threshold=args.lora_ar_threshold,
                 lora_output=args.lora_output,
+                # Checkpointing options
+                resume=args.resume,
+                sidecar_path=args.sidecar_path,
+                max_shard_size=args.max_shard_size,
+                no_checkpoint=args.no_checkpoint,
             )
             return
 
@@ -1476,6 +1514,11 @@ def run_conversion(args):
                 lora_depth=args.lora_depth,
                 lora_ar_threshold=args.lora_ar_threshold,
                 lora_output=args.lora_output,
+                # Checkpointing options
+                resume=args.resume,
+                sidecar_path=args.sidecar_path,
+                max_shard_size=args.max_shard_size,
+                no_checkpoint=args.no_checkpoint,
             )
             return
 
@@ -1833,6 +1876,11 @@ def run_conversion(args):
         lora_output=args.lora_output,
         input_scales=input_scales,
         actcal_lora=args.actcal_lora,
+        # Checkpointing options
+        resume=args.resume,
+        sidecar_path=args.sidecar_path,
+        max_shard_size=args.max_shard_size,
+        no_checkpoint=args.no_checkpoint,
     )
 
 

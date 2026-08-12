@@ -45,6 +45,10 @@ EXPERIMENTAL_ARGS = {
     "input_scales_path",
     "input_scale",
     "no_normalize_scales",
+    "resume",
+    "sidecar_path",
+    "max_shard_size",
+    "no_checkpoint",
 }
 
 # Generated from MODEL_FILTERS registry

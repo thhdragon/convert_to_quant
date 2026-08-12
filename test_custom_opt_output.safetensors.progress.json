@@ -1,0 +1,56 @@
+{
+  "version": "1.0",
+  "input_file": "/home/tyler/Documents/int4ctq/test_custom_opt_input.safetensors",
+  "output_file": "/home/tyler/Documents/int4ctq/test_custom_opt_output.safetensors",
+  "primary_format": "fp8",
+  "status": "completed",
+  "completed_layers": {
+    "blocks.0.attn.wk.weight": {
+      "status": "completed",
+      "base_name": "blocks.0.attn.wk",
+      "tensors_file": "/home/tyler/Documents/int4ctq/test_custom_opt_output.safetensors.checkpoint/blocks.0.attn.wk.weight.safetensors",
+      "meta_entry": {
+        "format": "float8_e4m3fn"
+      },
+      "skipped": false,
+      "use_custom": false,
+      "use_fallback": false,
+      "use_layer_config": false
+    },
+    "blocks.0.attn.wq.weight": {
+      "status": "completed",
+      "base_name": "blocks.0.attn.wq",
+      "tensors_file": "/home/tyler/Documents/int4ctq/test_custom_opt_output.safetensors.checkpoint/blocks.0.attn.wq.weight.safetensors",
+      "meta_entry": {
+        "format": "float8_e4m3fn"
+      },
+      "skipped": false,
+      "use_custom": false,
+      "use_fallback": false,
+      "use_layer_config": false
+    },
+    "blocks.0.mlp.down.weight": {
+      "status": "completed",
+      "base_name": "blocks.0.mlp.down",
+      "tensors_file": "/home/tyler/Documents/int4ctq/test_custom_opt_output.safetensors.checkpoint/blocks.0.mlp.down.weight.safetensors",
+      "meta_entry": {
+        "format": "float8_e4m3fn"
+      },
+      "skipped": false,
+      "use_custom": true,
+      "use_fallback": false,
+      "use_layer_config": false
+    }
+  },
+  "quant_metadata_layers": {
+    "blocks.0.attn.wk": {
+      "format": "float8_e4m3fn"
+    },
+    "blocks.0.attn.wq": {
+      "format": "float8_e4m3fn"
+    },
+    "blocks.0.mlp.down": {
+      "format": "float8_e4m3fn"
+    }
+  }
+}

@@ -77,11 +77,17 @@ def convert_to_fp8_scaled(
     lora_output: Optional[str] = None,
     input_scales: Optional[Dict[str, Any]] = None,
     actcal_lora: Optional[str] = None,
+    # Checkpointing & Resume options
+    resume: bool = False,
+    sidecar_path: Optional[str] = None,
+    max_shard_size: Optional[Union[str, int]] = None,
+    no_checkpoint: bool = False,
     **converter_kwargs,
 ):
     # Ensure filter_flags is a dict
     filter_flags = filter_flags or {}
 
+    from ..utils.checkpoint import QuantCheckpointManager
     from ..utils.parallel_utils import parse_devices, run_parallel_layer_processing
 
     target_devices = parse_devices(device=device, devices=devices)
@@ -97,6 +103,16 @@ def convert_to_fp8_scaled(
     else:
         target_format = "fp8"
         format_name = "FP8"
+
+    checkpoint_mgr = QuantCheckpointManager(
+        output_file=output_file,
+        input_file=input_file,
+        primary_format=target_format,
+        resume=resume,
+        sidecar_path=sidecar_path,
+        max_shard_size=max_shard_size,
+        no_checkpoint=no_checkpoint,
+    )
 
     info(f"Processing: {input_file}\nOutput will be saved to: {output_file}")
     info("-" * 60)
@@ -362,6 +378,12 @@ def convert_to_fp8_scaled(
 
     def process_layer_item(item: Tuple[int, str], dev: str) -> Dict[str, Any]:
         i, key = item
+
+        if checkpoint_mgr.is_layer_completed(key):
+            info(f"[{dev}] ({i + 1}/{total_weights}) Skipping (loaded from sidecar checkpoint): {key}")
+            loaded_res = checkpoint_mgr.load_completed_layer(key)
+            if loaded_res is not None:
+                return loaded_res
         exclusion_reason = ""
         use_custom = False
         use_fallback = False
@@ -828,7 +850,8 @@ def convert_to_fp8_scaled(
         if str(dev).startswith("cuda"):
             torch.cuda.empty_cache()
 
-        return {
+        res_item = {
+            "key": key,
             "base_name": base_name,
             "tensors": res_tensors,
             "lora_tensors": res_lora,
@@ -838,10 +861,13 @@ def convert_to_fp8_scaled(
             "use_fallback": use_fallback,
             "use_layer_config": use_layer_config,
         }
+        checkpoint_mgr.save_layer_checkpoint(res_item)
+        return res_item
 
     layer_results = run_parallel_layer_processing(work_items, process_layer_item, target_devices)
 
     for r in layer_results:
+        checkpoint_mgr.save_layer_checkpoint(r)
         if r.get("skipped"):
             skipped_count += 1
         else:
@@ -859,11 +885,12 @@ def convert_to_fp8_scaled(
             quant_metadata_layers[r["base_name"]] = r["meta_entry"]
 
     # Copy remaining tensors (bias, norms, etc.)
+    passthrough_tensors: Dict[str, torch.Tensor] = {}
     for key in all_keys:
         if any(n in key for n in T5XXL_REMOVE_KEY_NAMES) and filter_flags.get("t5xxl"):
             continue
-        if key not in new_tensors:
-            new_tensors[key] = loader.get_tensor(key)
+        if key not in new_tensors and not checkpoint_mgr.is_layer_completed(key):
+            passthrough_tensors[key] = loader.get_tensor(key)
 
     # Close loader to release file handle
     loader.close()
@@ -875,40 +902,21 @@ def convert_to_fp8_scaled(
         torch.cuda.empty_cache()
 
     # Add scaled_fp8 marker only for legacy non-comfy_quant FP8 format
-    # Use empty((0)) when input_scale is present (t5xxl, mistral, or --input_scale flag)
-    if not comfy_quant and not int8 and not custom_layers and "scaled_fp8" not in new_tensors:
+    if not comfy_quant and not int8 and not custom_layers and "scaled_fp8" not in new_tensors and "scaled_fp8" not in passthrough_tensors:
         has_text_encoder_filter = filter_flags.get("t5xxl") or filter_flags.get("mistral") or filter_flags.get("visual")
-        new_tensors["scaled_fp8"] = torch.empty((0), dtype=TARGET_FP8_DTYPE) if (has_text_encoder_filter or include_input_scale or bool(input_scales)) else torch.empty((2), dtype=TARGET_FP8_DTYPE)
+        passthrough_tensors["scaled_fp8"] = torch.empty((0), dtype=TARGET_FP8_DTYPE) if (has_text_encoder_filter or include_input_scale or bool(input_scales)) else torch.empty((2), dtype=TARGET_FP8_DTYPE)
 
-    info(f"Saving {len(new_tensors)} tensors to {output_file}")
-    try:
-        os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    passthrough_tensors.update(new_tensors)
+    passthrough_tensors, _ = normalize_tensorwise_scales(passthrough_tensors, NORMALIZE_SCALES_ENABLED)
 
-        # Prepare metadata args - preserve original metadata and merge with quant metadata
-        output_metadata = dict(original_metadata)  # Start with original file metadata
-        if save_quant_metadata and quant_metadata_layers:
-            full_metadata = {"format_version": "1.0", "layers": quant_metadata_layers}
-            output_metadata["_quantization_metadata"] = json.dumps(full_metadata)
-            info(f"  Adding quantization metadata for {len(quant_metadata_layers)} layers")
-        save_kwargs = {"metadata": output_metadata} if output_metadata else {}
-
-        # Normalize any 1-element scale tensors to scalars
-        new_tensors, normalized_count = normalize_tensorwise_scales(new_tensors, NORMALIZE_SCALES_ENABLED)
-        if normalized_count > 0:
-            info(f"  Normalized {normalized_count} scale tensors to scalars")
-        save_file(new_tensors, output_file, **save_kwargs)
-
-        # Save extracted LoRA adapter if any
-        if lora_tensors:
-            if not lora_save_path:
-                lora_save_path = lora_output or output_file.replace(".safetensors", "_lora.safetensors")
-
-            info(f"Saving {len(lora_tensors)} LoRA tensors to {lora_save_path}")
-            save_file(lora_tensors, lora_save_path)
-
-        info("Conversion complete!")
-    except Exception as e:
-        error(f"FATAL: Error saving file '{output_file}': {e}")
+    success = checkpoint_mgr.assemble_final_output(
+        passthrough_tensors=passthrough_tensors,
+        original_metadata=original_metadata,
+        lora_tensors=lora_tensors,
+        lora_save_path=lora_save_path or lora_output,
+    )
+    if not success:
+        error(f"FATAL: Error assembling final output file '{output_file}'")
         if calib_cache_dir and os.path.exists(calib_cache_dir):
             shutil.rmtree(calib_cache_dir)
         return
@@ -925,5 +933,4 @@ def convert_to_fp8_scaled(
     if fallback_count > 0:
         summary_parts.append(f"    - Fallback type layers: {fallback_count}")
     summary_parts.extend([f"  - Weights skipped       : {skipped_count}", f"  - Final tensor count    : {len(new_tensors)}"])
-    info("\n".join(summary_parts))
-    info("-" * 60)
+    info("Conversion complete!")
