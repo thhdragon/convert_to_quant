@@ -300,7 +300,10 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
             decay_factor = self.lr_factor if self.lr_factor < 1.0 else 0.95
             window_size = max(5, int(2.5 / (1.0 - decay_factor)))
             loss_span_threshold = self.early_stop_loss / (1.0 - decay_factor)
+            from tqdm.auto import tqdm
             import sys
+
+            log_interval = max(1, min(500, self.num_iter // 10))
             pbar = tqdm(
                 range(self.num_iter),
                 desc=f"    Optimizing W4A8 (Codebook-AdaRound-{self.optimizer_choice}-{schedule_name})",
@@ -440,6 +443,13 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                     )
                 pbar.refresh()
                 sys.stdout.flush()
+
+                # Explicit periodic progress log for Google Colab / Notebook cells / redirected logs
+                if (i + 1) % log_interval == 0 or i == 0 or i == self.num_iter - 1:
+                    info(
+                        f"      - Step {i+1:4d}/{self.num_iter} ({self.optimizer_choice}-{schedule_name}): "
+                        f"loss={current_loss_val:.3e}, best={best_loss:.3e}, lr={curr_lr:.2e}"
+                    )
 
             pbar.close()
             info(f"      - Finished: best_loss={best_loss:.3e}, iters={last_iter}/{self.num_iter}")
