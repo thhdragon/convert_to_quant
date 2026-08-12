@@ -153,9 +153,10 @@ Before finalizing any code mode session involving `convert_to_quant` optimizatio
 - [ ] Did you use `self._check_improvement` instead of `<`?
 - [ ] Did you wrap the `worse_loss_counter = 0` reset inside `if self.lr_adaptive_mode == "simple-reset":` during the `improved` block?
 - [ ] Did you implement all 3 schedulers (`exponential`, `plateau`, `adaptive`) exactly as shown?
+- [ ] Did you wrap external LR decay updates in `if self.optimizer_choice != "prodigy":` to let Prodigy manage its own $d$-adaptation?
 - [ ] Did you include the `debug` logs for `cooldown`, `Plateau reached`, `Decay`, and `Waiting` in the plateau scheduler?
 - [ ] Did you include the schedule-aware dynamic postfix?
 - [ ] Did you implement the comprehensive 6-condition early stopping `info()` logs?
-- [ ] If using Prodigy, did you instantiate it without `split_groups=True` to avoid extraneous CLI warnings?
+- [ ] If using Prodigy, did you instantiate `ProdigyPlusScheduleFree` with `split_groups=False` to avoid extraneous CLI warnings?
 
 If the answer to any of these is NO, **rewrite the loop** before committing the changes.

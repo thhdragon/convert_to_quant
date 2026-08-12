@@ -273,7 +273,7 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                 optimizer = RAdam([V], lr=curr_lr)
             elif self.optimizer_choice == "prodigy":
                 from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
-                optimizer = ProdigyPlusScheduleFree([V], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed)
+                optimizer = ProdigyPlusScheduleFree([V], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False)
             else:
                 optimizer = None  # manual SGD
 
@@ -385,40 +385,37 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                     worse_loss_counter += 1
                     plateau_counter += 1
 
-                prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-                if schedule_name == "exponential":
-                    if not prodigy_warmup:
+                # Prodigy manages its own adaptive LR; bypass external scheduler LR decay
+                if self.optimizer_choice != "prodigy":
+                    if schedule_name == "exponential":
                         curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                         if optimizer is not None:
                             for pg in optimizer.param_groups:
                                 pg["lr"] = curr_lr
-                elif schedule_name == "plateau":
-                    if prodigy_warmup:
-                        plateau_counter = 0
-                    elif cooldown_counter > 0:
-                        cooldown_counter -= 1
-                    elif plateau_counter >= effective_patience:
-                        if curr_lr > self.lr_min:
-                            old_lr = curr_lr
-                            curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                    elif schedule_name == "plateau":
+                        if cooldown_counter > 0:
+                            cooldown_counter -= 1
+                        elif plateau_counter >= effective_patience:
+                            if curr_lr > self.lr_min:
+                                old_lr = curr_lr
+                                curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                                if optimizer is not None:
+                                    for pg in optimizer.param_groups:
+                                        pg["lr"] = curr_lr
+                                cooldown_counter = effective_cooldown
+                            plateau_counter = 0
+                    else:  # adaptive
+                        new_lr, lr_updated = self._adaptive_lr_update_cosine(
+                            curr_lr, improved, prev_worse if improved else worse_loss_counter,
+                            i, (M, N), self.early_stop_lr
+                        )
+                        if lr_updated:
+                            curr_lr = new_lr
                             if optimizer is not None:
                                 for pg in optimizer.param_groups:
                                     pg["lr"] = curr_lr
-                            cooldown_counter = effective_cooldown
-                        plateau_counter = 0
-                else:  # adaptive
-                    new_lr, lr_updated = self._adaptive_lr_update_cosine(
-                        curr_lr, improved, prev_worse if improved else worse_loss_counter,
-                        i, (M, N), self.early_stop_lr
-                    )
-                    if lr_updated:
-                        curr_lr = new_lr
-                        if optimizer is not None:
-                            for pg in optimizer.param_groups:
-                                pg["lr"] = curr_lr
-                    if improved and self.lr_adaptive_mode == "no-reset":
-                        worse_loss_counter = 0
+                        if improved and self.lr_adaptive_mode == "no-reset":
+                            worse_loss_counter = 0
 
                 # Update progress bar with live training stats
                 if schedule_name == "plateau":

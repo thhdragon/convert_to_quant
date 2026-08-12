@@ -427,7 +427,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         delta = torch.zeros_like(W_rounded, requires_grad=True)
         curr_lr = self.lr
         optimizer = ProdigyPlusScheduleFree(
-            [delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed
+            [delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False
         )
 
         schedule_name = self.lr_schedule
@@ -474,35 +474,30 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            # Prodigy Warm-up: Skip LR decay for first 50 iterations
-            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-            # Manual LR update based on schedule
-            if schedule_name == "exponential":
-                if not prodigy_warmup:
+            # Manual LR update based on schedule (bypassed for Prodigy self-adaptation)
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
                     curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if prodigy_warmup:
-                    plateau_counter = 0  # Keep inactive
-                elif cooldown_counter > 0:
-                    cooldown_counter -= 1
-                    debug(f"      [LR] Cooldown: {cooldown_counter} left")
-                elif plateau_counter >= effective_patience:
-                    debug(
-                        f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
-                    )
-                    if curr_lr > self.lr_min:
-                        old_lr = curr_lr
-                        curr_lr = max(curr_lr * effective_factor, self.lr_min)
-                        for param_group in optimizer.param_groups:
-                            param_group["lr"] = curr_lr
-                        cooldown_counter = effective_cooldown
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                        debug(f"      [LR] Cooldown: {cooldown_counter} left")
+                    elif plateau_counter >= effective_patience:
                         debug(
-                            f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
+                            f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
                         )
-                    plateau_counter = 0
+                        if curr_lr > self.lr_min:
+                            old_lr = curr_lr
+                            curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                            for param_group in optimizer.param_groups:
+                                param_group["lr"] = curr_lr
+                            cooldown_counter = effective_cooldown
+                            debug(
+                                f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
+                            )
+                        plateau_counter = 0
                 elif plateau_counter > 0:
                     debug(
                         f"      [LR] Waiting: {plateau_counter}/{effective_patience} (Loss: {current_loss_val:.3e})"
@@ -1176,7 +1171,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
 
             optimizer = ProdigyPlusScheduleFree(
-                [V], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed
+                [V], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False
             )
         else:
             optimizer = None  # Will use manual SGD on V
@@ -1320,37 +1315,32 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-            if schedule_name == "exponential":
-                if not prodigy_warmup:
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
                     curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     if optimizer is not None:
                         for param_group in optimizer.param_groups:
                             param_group["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if prodigy_warmup:
-                    plateau_counter = 0
-                elif cooldown_counter > 0:
-                    cooldown_counter -= 1
-                    debug(f"      [LR] Cooldown: {cooldown_counter} left")
-                elif plateau_counter >= effective_patience:
-                    debug(
-                        f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
-                    )
-                    if curr_lr > self.lr_min:
-                        old_lr = curr_lr
-                        curr_lr = max(curr_lr * effective_factor, self.lr_min)
-                        if optimizer is not None:
-                            for param_group in optimizer.param_groups:
-                                param_group["lr"] = curr_lr
-                        cooldown_counter = effective_cooldown
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                        debug(f"      [LR] Cooldown: {cooldown_counter} left")
+                    elif plateau_counter >= effective_patience:
                         debug(
-                            f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
+                            f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
                         )
-                    plateau_counter = 0
-                else:
-                    if plateau_counter > 0:
+                        if curr_lr > self.lr_min:
+                            old_lr = curr_lr
+                            curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                            if optimizer is not None:
+                                for param_group in optimizer.param_groups:
+                                    param_group["lr"] = curr_lr
+                            cooldown_counter = effective_cooldown
+                            debug(
+                                f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
+                            )
+                        plateau_counter = 0
+                    elif plateau_counter > 0:
                         debug(
                             f"      [LR] Waiting: {plateau_counter}/{effective_patience} (Loss: {current_loss_val:.3e})"
                         )
@@ -1705,7 +1695,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
 
             optimizer = ProdigyPlusScheduleFree(
-                [V], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed
+                [V], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False
             )
         else:
             optimizer = None  # Will use manual SGD on V
@@ -1860,37 +1850,32 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            # Prodigy Warm-up: Skip LR decay for first 50 iterations
-            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-            # Schedule-based learning rate adjustments
-            if schedule_name == "exponential":
-                if not prodigy_warmup:
+            # Schedule-based learning rate adjustments (bypassed for Prodigy)
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
                     curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     if optimizer is not None:
                         for param_group in optimizer.param_groups:
                             param_group["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if prodigy_warmup:
-                    plateau_counter = 0  # Keep inactive
-                elif cooldown_counter > 0:
-                    cooldown_counter -= 1
-                    debug(f"      [LR] Cooldown: {cooldown_counter} left")
-                elif plateau_counter >= effective_patience:
-                    debug(
-                        f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
-                    )
-                    if curr_lr > self.lr_min:
-                        old_lr = curr_lr
-                        curr_lr = max(curr_lr * effective_factor, self.lr_min)
-                        if optimizer is not None:
-                            for param_group in optimizer.param_groups:
-                                param_group["lr"] = curr_lr
-                        cooldown_counter = effective_cooldown
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                        debug(f"      [LR] Cooldown: {cooldown_counter} left")
+                    elif plateau_counter >= effective_patience:
                         debug(
-                            f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
+                            f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
                         )
-                    plateau_counter = 0
+                        if curr_lr > self.lr_min:
+                            old_lr = curr_lr
+                            curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                            if optimizer is not None:
+                                for param_group in optimizer.param_groups:
+                                    param_group["lr"] = curr_lr
+                            cooldown_counter = effective_cooldown
+                            debug(
+                                f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
+                            )
+                        plateau_counter = 0
                 else:
                     if plateau_counter > 0:
                         debug(
@@ -2246,21 +2231,16 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            # Prodigy Warm-up: Skip LR decay for first 50 iterations
-            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-            # Manual LR update based on schedule (matching _optimize_int8_original)
-            if schedule_name == "exponential":
-                if not prodigy_warmup:
+            # Manual LR update based on schedule (bypassed for Prodigy)
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
                     curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if prodigy_warmup:
-                    plateau_counter = 0  # Keep inactive
-                elif cooldown_counter > 0:
-                    cooldown_counter -= 1
-                    debug(f"      [LR] Cooldown: {cooldown_counter} left")
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                        debug(f"      [LR] Cooldown: {cooldown_counter} left")
                 elif plateau_counter >= self.lr_patience:
                     debug(
                         f"      [LR] Plateau {plateau_counter}/{self.lr_patience} reached. Decaying."
@@ -2356,7 +2336,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
         curr_lr = self.lr
         optimizer = ProdigyPlusScheduleFree(
-            [delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed
+            [delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False
         )
 
         schedule_name = self.lr_schedule
@@ -2406,39 +2386,34 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            # Prodigy Warm-up: Skip LR decay for first 50 iterations
-            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-            # Manual LR update based on schedule
-            if schedule_name == "exponential":
-                if not prodigy_warmup:
+            # Manual LR update based on schedule (bypassed for Prodigy self-adaptation)
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
                     curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if prodigy_warmup:
-                    plateau_counter = 0  # Keep inactive
-                elif cooldown_counter > 0:
-                    cooldown_counter -= 1
-                elif plateau_counter >= self.lr_patience:
-                    if curr_lr > self.lr_min:
-                        curr_lr = max(curr_lr * self.lr_factor, self.lr_min)
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                    elif plateau_counter >= self.lr_patience:
+                        if curr_lr > self.lr_min:
+                            curr_lr = max(curr_lr * self.lr_factor, self.lr_min)
+                            for param_group in optimizer.param_groups:
+                                param_group["lr"] = curr_lr
+                            cooldown_counter = self.lr_cooldown
+                        plateau_counter = 0
+                else:  # 'adaptive' - cosine-based schedule
+                    counter_for_update = prev_worse_counter if improved else worse_loss_counter
+                    new_lr, lr_updated = self._adaptive_lr_update_cosine(
+                        curr_lr, improved, counter_for_update, i, (M, N), self.early_stop_lr
+                    )
+                    if lr_updated:
+                        curr_lr = new_lr
                         for param_group in optimizer.param_groups:
                             param_group["lr"] = curr_lr
-                        cooldown_counter = self.lr_cooldown
-                    plateau_counter = 0
-            else:  # 'adaptive' - cosine-based schedule
-                counter_for_update = prev_worse_counter if improved else worse_loss_counter
-                new_lr, lr_updated = self._adaptive_lr_update_cosine(
-                    curr_lr, improved, counter_for_update, i, (M, N), self.early_stop_lr
-                )
-                if lr_updated:
-                    curr_lr = new_lr
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = curr_lr
 
-                if improved and self.lr_adaptive_mode == "no-reset":
-                    worse_loss_counter = 0
+                    if improved and self.lr_adaptive_mode == "no-reset":
+                        worse_loss_counter = 0
 
             pbar.set_postfix(
                 {

@@ -875,12 +875,12 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
         if self.scale_optimization == "joint":
             block_scales_float = (total_scale / per_tensor_scale).clone().requires_grad_(True)
             optimizer = ProdigyPlusScheduleFree(
-                [delta, block_scales_float], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed
+                [delta, block_scales_float], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False
             )
             best_block_scales = block_scales_float.detach().clone()
         else:
             block_scales_float = None
-            optimizer = ProdigyPlusScheduleFree([delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed)
+            optimizer = ProdigyPlusScheduleFree([delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False)
             best_block_scales = None
 
         schedule_name = self.lr_schedule
@@ -937,29 +937,31 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            if schedule_name == "exponential":
-                curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
-                for pg in optimizer.param_groups:
-                    pg["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if cooldown_counter > 0:
-                    cooldown_counter -= 1
-                elif plateau_counter >= effective_patience:
-                    if curr_lr > self.lr_min:
-                        curr_lr = max(curr_lr * effective_factor, self.lr_min)
-                        for pg in optimizer.param_groups:
-                            pg["lr"] = curr_lr
-                        cooldown_counter = effective_cooldown
-                    plateau_counter = 0
-            else:  # 'adaptive'
-                counter_for_update = prev_worse_counter if improved else worse_loss_counter
-                new_lr, lr_updated = self._adaptive_lr_update_cosine(
-                    curr_lr, improved, counter_for_update, i, (M, N), self.early_stop_lr
-                )
-                if lr_updated:
-                    curr_lr = new_lr
+            # Prodigy self-adapts learning rate; bypass external scheduler LR decay
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
+                    curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     for pg in optimizer.param_groups:
                         pg["lr"] = curr_lr
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                    elif plateau_counter >= effective_patience:
+                        if curr_lr > self.lr_min:
+                            curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                            for pg in optimizer.param_groups:
+                                pg["lr"] = curr_lr
+                            cooldown_counter = effective_cooldown
+                        plateau_counter = 0
+                else:  # 'adaptive'
+                    counter_for_update = prev_worse_counter if improved else worse_loss_counter
+                    new_lr, lr_updated = self._adaptive_lr_update_cosine(
+                        curr_lr, improved, counter_for_update, i, (M, N), self.early_stop_lr
+                    )
+                    if lr_updated:
+                        curr_lr = new_lr
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = curr_lr
 
                 if improved and self.lr_adaptive_mode == "no-reset":
                     worse_loss_counter = 0

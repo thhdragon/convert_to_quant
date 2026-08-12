@@ -633,31 +633,26 @@ class LearnedMXFP8Converter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            # Prodigy Warm-up: Skip LR decay for first 50 iterations
-            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-            # LR schedule update
-            if schedule_name == "exponential":
-                if not prodigy_warmup:
+            # LR schedule update (bypassed for Prodigy self-adaptation)
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
                     curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     for pg in optimizer.param_groups:
                         pg["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if prodigy_warmup:
-                    plateau_counter = 0  # Keep inactive
-                elif cooldown_counter > 0:
-                    cooldown_counter -= 1
-                    debug(f"      [LR] Cooldown: {cooldown_counter} left")
-                elif plateau_counter >= effective_patience:
-                    debug(
-                        f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
-                    )
-                    if curr_lr > self.lr_min:
-                        old_lr = curr_lr
-                        curr_lr = max(curr_lr * effective_factor, self.lr_min)
-                        for pg in optimizer.param_groups:
-                            pg["lr"] = curr_lr
-                        cooldown_counter = effective_cooldown
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                        debug(f"      [LR] Cooldown: {cooldown_counter} left")
+                    elif plateau_counter >= effective_patience:
+                        debug(
+                            f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
+                        )
+                        if curr_lr > self.lr_min:
+                            old_lr = curr_lr
+                            curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                            for pg in optimizer.param_groups:
+                                pg["lr"] = curr_lr
+                            cooldown_counter = effective_cooldown
                         debug(
                             f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
                         )
@@ -807,31 +802,26 @@ class LearnedMXFP8Converter(BaseLearnedConverter):
                 worse_loss_counter += 1
                 plateau_counter += 1
 
-            # Prodigy Warm-up: Skip LR decay for first 50 iterations
-            prodigy_warmup = self.optimizer_choice == "prodigy" and i < 50
-
-            # LR schedule update
-            if schedule_name == "exponential":
-                if not prodigy_warmup:
+            # LR schedule update (bypassed for Prodigy self-adaptation)
+            if self.optimizer_choice != "prodigy":
+                if schedule_name == "exponential":
                     curr_lr = max(curr_lr * self.lr_gamma, self.lr_min)
                     for pg in optimizer.param_groups:
                         pg["lr"] = curr_lr
-            elif schedule_name == "plateau":
-                if prodigy_warmup:
-                    plateau_counter = 0  # Keep inactive
-                elif cooldown_counter > 0:
-                    cooldown_counter -= 1
-                    debug(f"      [LR] Cooldown: {cooldown_counter} left")
-                elif plateau_counter >= effective_patience:
-                    debug(
-                        f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
-                    )
-                    if curr_lr > self.lr_min:
-                        old_lr = curr_lr
-                        curr_lr = max(curr_lr * effective_factor, self.lr_min)
-                        for pg in optimizer.param_groups:
-                            pg["lr"] = curr_lr
-                        cooldown_counter = effective_cooldown
+                elif schedule_name == "plateau":
+                    if cooldown_counter > 0:
+                        cooldown_counter -= 1
+                        debug(f"      [LR] Cooldown: {cooldown_counter} left")
+                    elif plateau_counter >= effective_patience:
+                        debug(
+                            f"      [LR] Plateau {plateau_counter}/{effective_patience} reached. Decaying."
+                        )
+                        if curr_lr > self.lr_min:
+                            old_lr = curr_lr
+                            curr_lr = max(curr_lr * effective_factor, self.lr_min)
+                            for pg in optimizer.param_groups:
+                                pg["lr"] = curr_lr
+                            cooldown_counter = effective_cooldown
                         debug(
                             f"      [LR] Decay: {old_lr:.2e} -> {curr_lr:.2e} (Factor: {effective_factor:.4f})"
                         )
@@ -924,7 +914,7 @@ class LearnedMXFP8Converter(BaseLearnedConverter):
         delta = torch.zeros_like(qdata_f32, requires_grad=True)
         curr_lr = self.lr
         optimizer = ProdigyPlusScheduleFree(
-            [delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed
+            [delta], lr=curr_lr, use_schedulefree=False, use_speed=self.use_speed, split_groups=False
         )
 
         current_block_scales_f32 = block_scales_f32.clone()
