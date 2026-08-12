@@ -6,6 +6,8 @@ import torch
 from safetensors.torch import save_file
 
 from convert_to_quant.converters.learned_mxfp8 import LearnedMXFP8Converter
+from convert_to_quant.converters.learned_nvfp4 import LearnedNVFP4Converter
+from convert_to_quant.converters.learned_rounding import LearnedRoundingConverter
 from convert_to_quant.formats.fp8_conversion import convert_to_fp8_scaled
 from convert_to_quant.formats.mxfp8_conversion import convert_to_mxfp8
 from convert_to_quant.formats.nvfp4_conversion import convert_to_nvfp4
@@ -140,6 +142,10 @@ class TestLoraExtraction(unittest.TestCase):
             convert_to_fp8_scaled(
                 input_path,
                 output_fp8,
+                comfy_quant=True,
+                filter_flags={},
+                calib_samples=3072,
+                seed=42,
                 simple=True,
                 extract_lora=True,
                 lora_rank=4,
@@ -147,6 +153,24 @@ class TestLoraExtraction(unittest.TestCase):
                 lora_output=lora_out,
             )
             self.assertTrue(os.path.exists(lora_out))
+
+    def test_device_mismatch_lora_extraction(self):
+        from convert_to_quant.converters.base_converter import BaseLearnedConverter
+
+        class DummyConverter(BaseLearnedConverter):
+            def convert(self, W_orig, key=None, depth=-1, **kwargs):
+                pass
+
+        converter = DummyConverter(extract_lora=True, lora_rank=4)
+        W_orig = torch.randn(64, 64, device="cpu")
+        device_cuda = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        W_dequant = torch.randn(64, 64, device=device_cuda)
+
+        lora_data = converter._extract_error_lora(W_orig, W_dequant)
+        self.assertIsNotNone(lora_data)
+        self.assertIn("lora_up", lora_data)
+        self.assertIn("lora_down", lora_data)
+        self.assertEqual(lora_data["lora_up"].device, torch.device("cpu"))
 
 
 if __name__ == "__main__":

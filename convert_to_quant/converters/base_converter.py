@@ -231,8 +231,18 @@ class BaseLearnedConverter(ABC):
             return None
 
         with torch.no_grad():
-            # Ensure everything is on same device and float32 for SVD
-            error = (W_orig - W_dequant).to(device=W_orig.device, dtype=torch.float32)
+            # Ensure both tensors are on the same target device and float32 for SVD
+            if W_dequant.device.type != "cpu":
+                target_device = W_dequant.device
+            elif W_orig.device.type != "cpu":
+                target_device = W_orig.device
+            elif hasattr(self, "device") and self.device:
+                target_device = torch.device(self.device)
+            else:
+                target_device = W_orig.device
+
+            error = (W_orig.to(device=target_device, dtype=torch.float32) -
+                     W_dequant.to(device=target_device, dtype=torch.float32))
 
             # Flatten if necessary (for convs)
             if error.ndim > 2:
