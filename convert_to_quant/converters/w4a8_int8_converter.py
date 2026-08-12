@@ -303,10 +303,11 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
             from tqdm.auto import tqdm
             import sys
 
-            log_interval = max(1, min(500, self.num_iter // 10))
+            display_schedule = "self-adapted" if self.optimizer_choice == "prodigy" else schedule_name
+            log_interval = max(1, min(500, self.num_iter // 100))
             pbar = tqdm(
                 range(self.num_iter),
-                desc=f"    Optimizing W4A8 (Codebook-AdaRound-{self.optimizer_choice}-{schedule_name})",
+                desc=f"    Optimizing W4A8 (Codebook-AdaRound-{self.optimizer_choice}-{display_schedule})",
                 file=sys.stdout,
                 mininterval=0.0,
                 miniters=1,
@@ -444,7 +445,7 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                 # Explicit periodic progress log for Google Colab / Notebook cells / redirected logs
                 if (i + 1) % log_interval == 0 or i == 0 or i == self.num_iter - 1:
                     info(
-                        f"      - Step {i+1:4d}/{self.num_iter} ({self.optimizer_choice}-{schedule_name}): "
+                        f"      - Step {i+1:4d}/{self.num_iter} ({self.optimizer_choice}-{display_schedule}): "
                         f"loss={current_loss_val:.3e}, best={best_loss:.3e}, lr={curr_lr:.2e}"
                     )
 
