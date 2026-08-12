@@ -282,10 +282,13 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
             decay_factor = self.lr_factor if self.lr_factor < 1.0 else 0.95
             window_size = max(5, int(2.5 / (1.0 - decay_factor)))
             loss_span_threshold = self.early_stop_loss / (1.0 - decay_factor)
-
+            import sys
             pbar = tqdm(
                 range(self.num_iter),
                 desc=f"    Optimizing W4A8 (AdaRound-{self.optimizer_choice}-{schedule_name})",
+                file=sys.stdout,
+                mininterval=0.0,
+                miniters=1,
                 leave=True,
                 dynamic_ncols=True,
             )
@@ -328,14 +331,7 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                     with torch.no_grad():
                         V -= curr_lr * (V.grad / 1e5)
 
-                with torch.no_grad():
-                    h_V_hard = (h_V >= 0.5).float()
-                    W_dequant_hard = (W_floor + h_V_hard).clamp(-7, 7) * s_channel_bc
-                    Y_pred_hard = X @ W_dequant_hard.T
-                    current_loss_val = (
-                        torch.nn.functional.mse_loss(Y_pred_hard, Y_ref) / max(init_mse.item(), 1e-12)
-                    ).item()
-
+                current_loss_val = loss.item()
                 improved = self._check_improvement(current_loss_val, best_loss)
                 loss_history.append(current_loss_val)
                 if len(loss_history) > window_size:
@@ -404,7 +400,8 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                             "best": f"{best_loss:.3e}",
                             "lr": f"{curr_lr:.2e}",
                             "plateau": f"{plateau_counter}/{effective_patience if effective_patience is not None else '?'}",
-                        }
+                        },
+                        refresh=True,
                     )
                 else:
                     pbar.set_postfix(
@@ -413,8 +410,10 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                             "best": f"{best_loss:.3e}",
                             "lr": f"{curr_lr:.2e}",
                             "worse_count": f"{worse_loss_counter}",
-                        }
+                        },
+                        refresh=True,
                     )
+                sys.stdout.flush()
 
             pbar.close()
             info(f"      - Finished: best_loss={best_loss:.3e}, iters={last_iter}/{self.num_iter}")
