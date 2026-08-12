@@ -592,7 +592,7 @@ def convert_to_fp8_scaled(
                     full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None,
                     convrot=True,
                     convrot_groupsize=getattr(converter, "convrot_groupsize", 256),
-                    scale_dtype=str(getattr(converter, "scale_dtype", "float8_e4m3fn")),
+                    scale_dtype=str(getattr(converter, "scale_dtype", "float32")),
                     symmetric=getattr(converter, "symmetric", True),
                     codebook=getattr(converter, "codebook", True),
                 )
