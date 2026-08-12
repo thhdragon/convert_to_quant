@@ -286,11 +286,13 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
             pbar = tqdm(
                 range(self.num_iter),
                 desc=f"    Optimizing W4A8 (AdaRound-{self.optimizer_choice}-{schedule_name})",
-                leave=False,
+                leave=True,
                 dynamic_ncols=True,
             )
 
+            last_iter = 0
             for i in pbar:
+                last_iter = i + 1
                 if optimizer is not None:
                     optimizer.zero_grad()
 
@@ -326,7 +328,14 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                     with torch.no_grad():
                         V -= curr_lr * (V.grad / 1e5)
 
-                current_loss_val = loss.item()
+                with torch.no_grad():
+                    h_V_hard = (h_V >= 0.5).float()
+                    W_dequant_hard = (W_floor + h_V_hard).clamp(-7, 7) * s_channel_bc
+                    Y_pred_hard = X @ W_dequant_hard.T
+                    current_loss_val = (
+                        torch.nn.functional.mse_loss(Y_pred_hard, Y_ref) / max(init_mse.item(), 1e-12)
+                    ).item()
+
                 improved = self._check_improvement(current_loss_val, best_loss)
                 loss_history.append(current_loss_val)
                 if len(loss_history) > window_size:
@@ -384,6 +393,8 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                         if optimizer is not None:
                             for pg in optimizer.param_groups:
                                 pg["lr"] = curr_lr
+                    if improved and self.lr_adaptive_mode == "no-reset":
+                        worse_loss_counter = 0
 
                 # Update progress bar with live training stats
                 if schedule_name == "plateau":
@@ -406,7 +417,7 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                     )
 
             pbar.close()
-            info(f"      - Finished: best_loss={best_loss:.3e}, iters={i+1}/{self.num_iter}")
+            info(f"      - Finished: best_loss={best_loss:.3e}, iters={last_iter}/{self.num_iter}")
 
             # Apply best rounding decisions → re-quantize to get final hard integers
             with torch.no_grad():

@@ -223,6 +223,8 @@ def convert_to_fp8_scaled(
             w4a8_kwargs = {k: v for k, v in kwargs.items() if k not in ("target_format", "scaling_mode")}
             if "block_size" in w4a8_kwargs:
                 w4a8_kwargs["group_size"] = w4a8_kwargs.pop("block_size")
+            if "convrot_group_size" in w4a8_kwargs:
+                w4a8_kwargs["convrot_groupsize"] = w4a8_kwargs.pop("convrot_group_size")
             return LearnedW4A8Int8Converter(**w4a8_kwargs)
         elif fmt in ("int4", "convrot_w4a4"):
             int4_kwargs = kwargs.copy()
