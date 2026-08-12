@@ -332,7 +332,9 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                 if len(loss_history) > window_size:
                     loss_history.pop(0)
 
-                converged_ratio = ((torch.sigmoid(V) < 0.05) | (torch.sigmoid(V) > 0.95)).float().mean().item()
+                # Use temperature-scaled sigmoid to match the actual soft-rounding state
+                h_V_check = torch.sigmoid(V / temp)
+                converged_ratio = ((h_V_check < 0.05) | (h_V_check > 0.95)).float().mean().item()
                 if converged_ratio >= 0.90 and len(loss_history) == window_size:
                     loss_span = max(loss_history) - min(loss_history)
                     if loss_span < loss_span_threshold:
@@ -383,7 +385,28 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                             for pg in optimizer.param_groups:
                                 pg["lr"] = curr_lr
 
+                # Update progress bar with live training stats
+                if schedule_name == "plateau":
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{current_loss_val:.3e}",
+                            "best": f"{best_loss:.3e}",
+                            "lr": f"{curr_lr:.2e}",
+                            "plateau": f"{plateau_counter}/{effective_patience if effective_patience is not None else '?'}",
+                        }
+                    )
+                else:
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{current_loss_val:.3e}",
+                            "best": f"{best_loss:.3e}",
+                            "lr": f"{curr_lr:.2e}",
+                            "worse_count": f"{worse_loss_counter}",
+                        }
+                    )
+
             pbar.close()
+            info(f"      - Finished: best_loss={best_loss:.3e}, iters={i+1}/{self.num_iter}")
 
             # Apply best rounding decisions → re-quantize to get final hard integers
             with torch.no_grad():
