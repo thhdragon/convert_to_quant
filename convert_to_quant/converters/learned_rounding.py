@@ -1269,19 +1269,29 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 loss_svd_scaled = 0.0
 
             loss = loss_mse_scaled + 0.01 * loss_svd_scaled + 0.1 * loss_reg
-            scaled_loss = loss * 1e5
-
-            if optimizer is not None:
-                scaled_loss.backward()
-                if V.grad is not None:
-                    V.grad.div_(1e5)
-                optimizer.step()
+            if self.optimizer_choice == "prodigy":
+                if optimizer is not None:
+                    loss.backward()
+                    optimizer.step()
+                else:
+                    if V.grad is not None:
+                        V.grad.zero_()
+                    loss.backward()
+                    with torch.no_grad():
+                        V -= curr_lr * V.grad
             else:
-                if V.grad is not None:
-                    V.grad.zero_()
-                scaled_loss.backward()
-                with torch.no_grad():
-                    V -= curr_lr * (V.grad / 1e5)
+                scaled_loss = loss * 1e5
+                if optimizer is not None:
+                    scaled_loss.backward()
+                    if V.grad is not None:
+                        V.grad.div_(1e5)
+                    optimizer.step()
+                else:
+                    if V.grad is not None:
+                        V.grad.zero_()
+                    scaled_loss.backward()
+                    with torch.no_grad():
+                        V -= curr_lr * (V.grad / 1e5)
 
             current_loss_val = loss.item()
             prev_worse_counter = worse_loss_counter
@@ -1794,23 +1804,29 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             # Combine with fixed weights: 1.0 for MSE, 0.01 for SVD, 0.1 for Reg
             loss = loss_mse_scaled + 0.01 * loss_svd_scaled + 0.1 * loss_reg
 
-            # Scale up loss for backpropagation to prevent float32 underflow on large layers
-            scaled_loss = loss * 1e5
-
-            if optimizer is not None:
-                scaled_loss.backward()
-                if V.grad is not None:
-                    # Scale gradients back down before optimizer steps to protect scale-sensitive optimizers (e.g. Prodigy distance estimator)
-                    V.grad.div_(1e5)
-                optimizer.step()
+            if self.optimizer_choice == "prodigy":
+                if optimizer is not None:
+                    loss.backward()
+                    optimizer.step()
+                else:
+                    if V.grad is not None:
+                        V.grad.zero_()
+                    loss.backward()
+                    with torch.no_grad():
+                        V -= curr_lr * V.grad
             else:
-                # Manual SGD
-                if V.grad is not None:
-                    V.grad.zero_()
-                scaled_loss.backward()
-                with torch.no_grad():
-                    # Divide gradient back down to match manual learning rate scale
-                    V -= curr_lr * (V.grad / 1e5)
+                scaled_loss = loss * 1e5
+                if optimizer is not None:
+                    scaled_loss.backward()
+                    if V.grad is not None:
+                        V.grad.div_(1e5)
+                    optimizer.step()
+                else:
+                    if V.grad is not None:
+                        V.grad.zero_()
+                    scaled_loss.backward()
+                    with torch.no_grad():
+                        V -= curr_lr * (V.grad / 1e5)
 
             current_loss_val = loss.item()
             prev_worse_counter = worse_loss_counter

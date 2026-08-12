@@ -317,19 +317,16 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                 loss_reg = (1.0 - (2.0 * h_V - 1.0).pow(2)).mean()
 
                 loss = loss_mse + 0.01 * loss_svd + 0.1 * loss_reg
-                scaled_loss = loss * 1e5
 
                 if optimizer is not None:
-                    scaled_loss.backward()
-                    if V.grad is not None:
-                        V.grad.div_(1e5)
+                    loss.backward()
                     optimizer.step()
                 else:
                     if V.grad is not None:
                         V.grad.zero_()
-                    scaled_loss.backward()
+                    loss.backward()
                     with torch.no_grad():
-                        V -= curr_lr * (V.grad / 1e5)
+                        V -= curr_lr * V.grad
 
                 current_loss_val = loss.item()
                 improved = self._check_improvement(current_loss_val, best_loss)
@@ -413,6 +410,7 @@ class LearnedW4A8Int8Converter(BaseLearnedConverter):
                         },
                         refresh=True,
                     )
+                pbar.refresh()
                 sys.stdout.flush()
 
             pbar.close()
