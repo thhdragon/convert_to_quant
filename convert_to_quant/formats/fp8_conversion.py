@@ -113,6 +113,9 @@ def convert_to_fp8_scaled(
         info("Target format: NVFP4 (NVIDIA FP4 E2M1)")
     elif target_format == "mxfp8":
         info("Target format: MXFP8 (Microscaling FP8)")
+    elif target_format in ("w4a8_int8", "asym_w4a8_int8", "w4a8"):
+        info("Target format: W4A8 INT8 (AsymW4A8Int8Layout)")
+        info("  4-bit weights, 8-bit activations, per-group FP8 scales + per-channel FP32 scales")
     else:
         info(f"Target FP8 format: {TARGET_FP8_DTYPE}\nFP8 Range: [{FP8_MIN}, {FP8_MAX}]")
     info("-" * 60)

@@ -62,6 +62,15 @@ def convert_to_w4a8_int8(
     if seed == -1:
         seed = int(torch.randint(0, 2**32 - 1, ()).item())
 
+    # Resolve scale_dtype string to actual torch.dtype
+    _dtype_map = {
+        "float8_e4m3fn": torch.float8_e4m3fn,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    resolved_scale_dtype = _dtype_map.get(scale_dtype, torch.float8_e4m3fn)
+
     return convert_to_fp8_scaled(
         input_file=input_file,
         output_file=output_file,
@@ -71,9 +80,12 @@ def convert_to_w4a8_int8(
         primary_format="w4a8_int8",
         filter_flags=filter_flags,
         exclude_layers=exclude_layers,
-        simple=simple,
+        no_learned_rounding=simple,
         block_size=group_size,
         convrot_group_size=convrot_group_size,
+        scale_dtype=resolved_scale_dtype,
+        symmetric=symmetric,
+        codebook=codebook,
         low_memory=low_memory,
         **kwargs,
     )
