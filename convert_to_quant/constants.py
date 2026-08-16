@@ -50,6 +50,7 @@ VISUAL_AVOID_KEY_NAMES = [
     "patch_embed",
     "pos_embed",
     "merger",
+    "visual"
 ]
 QWEN_AVOID_KEY_NAMES = ["norm_added_k", "norm_added_q", "norm_k", "norm_q", "txt_norm"]
 HUNYUAN_AVOID_KEY_NAMES = [
@@ -436,6 +437,8 @@ VALID_QUANT_FORMATS = {
     "mxfp8",  # Microscaling FP8 block quantization
     "hybrid_mxfp8",  # Hybrid MXFP8 (MXFP8 + tensorwise fallback)
     "w4a8_int8",  # Grouped W4A8 INT8 (AsymW4A8Int8Layout)
+    "asym_w4a8_int8",  # Standard ComfyUI format key for AsymW4A8Int8Layout
+    "w4a8",
 }
 
 # Global config: normalize 1-element scale arrays to scalars (set from CLI)

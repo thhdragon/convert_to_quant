@@ -153,7 +153,7 @@ def convert_w4a8_int8_to_comfy_quant(
             output_tensors[f"{base_name}.{k}"] = v
 
         comfy_quant_tensor = create_comfy_quant_tensor(
-            "w4a8_int8",
+            "asym_w4a8_int8",
             block_size=group_size,
             convrot=True,
             convrot_groupsize=convrot_group_size,
@@ -162,7 +162,7 @@ def convert_w4a8_int8_to_comfy_quant(
 
         if save_quant_metadata and quant_metadata_layers is not None:
             quant_metadata_layers[base_name] = {
-                "format": "w4a8_int8",
+                "format": "asym_w4a8_int8",
                 "group_size": group_size,
                 "convrot": True,
                 "convrot_groupsize": convrot_group_size,

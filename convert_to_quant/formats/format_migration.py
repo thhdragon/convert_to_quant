@@ -538,7 +538,7 @@ def scan_and_replace_comfy_quant_metadata(
             M, N = weight.shape[0], weight.shape[1] if weight.ndim >= 2 else 1
 
             if is_w4a8_layer:
-                format_type = "w4a8_int8"
+                format_type = "asym_w4a8_int8"
                 convrot_flag = True
                 convrot_gs = convrot_gs or convrot_group_size
                 if block_size is None:
@@ -599,8 +599,8 @@ def scan_and_replace_comfy_quant_metadata(
                         block_size = fallback_bs
 
             # Ensure block-based formats have group_size set
-            if format_type in ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4", "int4_convrot", "w4a8_int8") and block_size is None:
-                block_size = default_block_size if default_block_size is not None else (16 if format_type == "w4a8_int8" else (64 if format_type in ("convrot_w4a4", "int4_convrot") else 128))
+            if format_type in ("int8_blockwise", "float8_e4m3fn_blockwise", "convrot_w4a4", "int4_convrot", "w4a8_int8", "asym_w4a8_int8") and block_size is None:
+                block_size = default_block_size if default_block_size is not None else (16 if format_type in ("w4a8_int8", "asym_w4a8_int8") else (64 if format_type in ("convrot_w4a4", "int4_convrot") else 128))
 
             # Create updated .comfy_quant tensor
             comfy_quant_tensor = create_comfy_quant_tensor(

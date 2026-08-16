@@ -60,6 +60,10 @@ def create_comfy_quant_tensor(
     Returns:
         torch.uint8 tensor containing JSON-encoded layer configuration
     """
+    # ComfyUI registers the native op format as "asym_w4a8_int8"
+    if format_type in ("w4a8_int8", "w4a8"):
+        format_type = "asym_w4a8_int8"
+
     comfy_quant = {"format": format_type}
 
     # Add group_size directly (not nested in params) for block-based formats

@@ -644,10 +644,10 @@ def convert_to_fp8_scaled(
                     res_tensors[f"{base_name}._correction"] = correction.to(device="cpu")
                 if codebook is not None:
                     res_tensors[f"{base_name}._codebook"] = codebook.to(device="cpu")
-                comfy_quant_format = "w4a8_int8"
+                comfy_quant_format = "asym_w4a8_int8"
                 block_size_for_meta = getattr(converter, "group_size", 16)
                 comfy_quant_tensor = create_comfy_quant_tensor(
-                    "w4a8_int8",
+                    "asym_w4a8_int8",
                     block_size=block_size_for_meta,
                     full_precision_matrix_mult=layer_full_precision_mm if layer_full_precision_mm else None,
                     convrot=True,
