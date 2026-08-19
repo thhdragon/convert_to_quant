@@ -9,6 +9,7 @@
       "status": "completed",
       "base_name": "blocks.0.attn.wk",
       "tensors_file": "/home/tyler/Documents/int4ctq/test_custom_opt_output.safetensors.checkpoint/blocks.0.attn.wk.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,
@@ -25,6 +26,7 @@
       "status": "completed",
       "base_name": "blocks.0.attn.wq",
       "tensors_file": "/home/tyler/Documents/int4ctq/test_custom_opt_output.safetensors.checkpoint/blocks.0.attn.wq.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,
@@ -40,6 +42,7 @@
       "status": "completed",
       "base_name": "blocks.0.mlp.down",
       "tensors_file": "/home/tyler/Documents/int4ctq/test_custom_opt_output.safetensors.checkpoint/blocks.0.mlp.down.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,

@@ -263,6 +263,10 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 act_dequant = unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
                 del qact, x_scales
 
+            # Channel feature-variance weighting for target activations
+            out_var = Y_ref.pow(2).mean(dim=0).clamp_min(1e-6)
+            channel_weights = (out_var / out_var.mean()).unsqueeze(0)
+
         U_k, Vh_k, k = self._compute_svd_components(W_float32, verbose=True)
 
         scale_broadcast = scale.unsqueeze(1) if scale.dim() == 1 else scale
@@ -294,7 +298,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         with torch.no_grad():
             init_W_q_rounded = unpack_int4_row_major(qdata).to(COMPUTE_DTYPE)
             init_W_rounded_dequant = init_W_q_rounded * scale_broadcast
-            init_mse_rounded = torch.nn.functional.mse_loss(act_dequant @ init_W_rounded_dequant.T, Y_ref)
+            init_mse_rounded = (channel_weights * (act_dequant @ init_W_rounded_dequant.T - Y_ref).pow(2)).mean()
             init_svd_rounded = torch.linalg.norm(U_k.T @ (init_W_rounded_dequant - W_float32) @ Vh_k.T)
             del init_W_q_rounded, init_W_rounded_dequant
             if torch.cuda.is_available():
@@ -341,18 +345,28 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             converged_ratio = ((torch.sigmoid(V) < 0.05) | (torch.sigmoid(V) > 0.95)).float().mean().item()
 
             Y_pred = act_dequant @ W_dequant.T
-            loss_mse = torch.nn.functional.mse_loss(Y_pred, Y_ref)
+            loss_mse = (channel_weights * (Y_pred - Y_ref).pow(2)).mean()
 
             weight_error = W_dequant - W_float32
             projected_error = U_k.T @ weight_error @ Vh_k.T
             loss_svd = torch.linalg.norm(projected_error)
+
+            # 2-Phase Regularization Penalty Schedule:
+            # Phase 1 (0-25% of iterations): beta_reg = 0.0 (unconstrained loss landscape exploration)
+            # Phase 2 (25-100% of iterations): smooth cosine ramp from 0.0 -> 0.1
+            progress = i / max(self.num_iter, 1)
+            if progress < 0.25:
+                reg_weight = 0.0
+            else:
+                phase2_p = (progress - 0.25) / 0.75
+                reg_weight = 0.1 * (0.5 * (1.0 - math.cos(math.pi * phase2_p)))
 
             loss_reg = (1.0 - (2.0 * h_V - 1.0).pow(2)).mean()
 
             loss_mse_scaled = loss_mse / max(init_mse_rounded.item(), 1e-12)
             loss_svd_scaled = loss_svd / init_svd_rounded.item() if (alpha_svd > 0 and init_svd_rounded.item() > 1e-8) else 0.0
 
-            loss = loss_mse_scaled + 0.01 * loss_svd_scaled + 0.1 * loss_reg
+            loss = loss_mse_scaled + 0.01 * loss_svd_scaled + reg_weight * loss_reg
 
             if self.optimizer_choice == "prodigy":
                 if optimizer is not None:

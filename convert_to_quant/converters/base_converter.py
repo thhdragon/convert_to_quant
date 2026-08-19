@@ -187,38 +187,36 @@ class BaseLearnedConverter(ABC):
             if block_match:
                 block_idx = int(block_match.group(1))
 
-        if block_idx != -1:
-            # Global Depth Limit: if lora_depth > 0, block_idx must be < lora_depth
-            if self.lora_depth > 0 and block_idx >= self.lora_depth:
+        # Global Depth Limit: if lora_depth > 0, block_idx must be < lora_depth
+        if block_idx != -1 and self.lora_depth > 0 and block_idx >= self.lora_depth:
+            return False
+
+        # 3. Calculate Aspect Ratio & Layer Sensitivity
+        if len(shape) >= 2:
+            rows, cols = shape[0], shape[1]
+            ar = max(rows, cols) / min(rows, cols)
+
+            # User Aspect Ratio Threshold Override
+            if self.lora_ar_threshold > 0.0:
+                return ar < self.lora_ar_threshold
+
+            # Case 3: AR > 4.0 -> Too large. Never extract.
+            if ar > 4.0:
                 return False
 
-            # Calculate Aspect Ratio
-            if len(shape) >= 2:
-                rows, cols = shape[0], shape[1]
-                ar = max(rows, cols) / min(rows, cols)
+            # Case 1: AR < 3.0 -> Safe zone. Extract if below depth.
+            if ar < 3.0:
+                return True
 
-                # 3. User Aspect Ratio Threshold Override (LESS THAN targets square layers)
-                if self.lora_ar_threshold > 0.0:
-                    return ar < self.lora_ar_threshold
+            # Case 2: 3.0 <= AR <= 4.0 -> Marginal zone.
+            if block_idx in (0, -1):
+                return True
 
-                # Case 3: AR > 4.0 -> Too large. Never extract (default logic).
-                if ar > 4.0:
-                    return False
+            k_lower = key.lower()
+            if "qkv" in k_lower or "attn" in k_lower or "proj" in k_lower:
+                return True
 
-                # Case 1: AR < 3.0 -> Safe zone. Extract if below depth (default logic).
-                if ar < 3.0:
-                    return True
-
-                # Case 2: 3.0 <= AR <= 4.0 -> Marginal zone.
-                # Extract if Block 0 OR specific sensitive type (QKV/Attn).
-                if block_idx == 0:
-                    return True
-
-                k_lower = key.lower()
-                if "qkv" in k_lower or "attn" in k_lower or "proj" in k_lower:
-                    return True
-
-                return False
+            return False
 
         return False
 

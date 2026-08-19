@@ -9,6 +9,7 @@
       "status": "completed",
       "base_name": null,
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/decoder.block.0.attn.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": null,
       "skipped": true,
       "use_custom": false,
@@ -29,6 +30,7 @@
       "status": "completed",
       "base_name": "final_layer.linear",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/final_layer.linear.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,
@@ -82,6 +84,7 @@
       "status": "completed",
       "base_name": null,
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/lm_head.proj.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": null,
       "skipped": true,
       "use_custom": false,
@@ -162,6 +165,7 @@
       "status": "completed",
       "base_name": "net.blocks.0.attn",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/net.blocks.0.attn.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,
@@ -177,6 +181,7 @@
       "status": "completed",
       "base_name": "net.blocks.1.adaln_modulation",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/net.blocks.1.adaln_modulation.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,
@@ -228,6 +233,7 @@
       "status": "completed",
       "base_name": "transformer.blocks.2.attn.proj",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/transformer.blocks.2.attn.proj.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,
@@ -243,6 +249,7 @@
       "status": "completed",
       "base_name": "transformer.blocks.2.attn.qkv",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/transformer.blocks.2.attn.qkv.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,
@@ -258,6 +265,7 @@
       "status": "completed",
       "base_name": "transformer.blocks.2.mlp.fc1",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/transformer.blocks.2.mlp.fc1.weight.safetensors",
+      "lora_tensors_file": null,
       "meta_entry": {
         "format": "convrot_w4a4",
         "group_size": 64,

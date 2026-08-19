@@ -328,8 +328,14 @@ def convert_to_int4_convrot(
             base_key = key[: key.rfind(".weight")]
             for lora_key, lora_tensor in extra_tensors.items():
                 if lora_key in ("lora_up", "lora_down"):
-                    if base_key.startswith("diffusion_model.") or base_key.startswith("text_encoders."):
+                    if base_key.startswith("model.diffusion_model."):
+                        clean_base = base_key[6:]
+                        full_lora_key = f"{clean_base}.{lora_key}.weight"
+                    elif base_key.startswith("diffusion_model.") or base_key.startswith("text_encoders."):
                         full_lora_key = f"{base_key}.{lora_key}.weight"
+                    elif base_key.startswith("model."):
+                        clean_base = base_key[6:]
+                        full_lora_key = f"diffusion_model.{clean_base}.{lora_key}.weight"
                     else:
                         full_lora_key = f"diffusion_model.{base_key}.{lora_key}.weight"
                     res_lora[full_lora_key] = lora_tensor.cpu()
@@ -397,10 +403,17 @@ def convert_to_int4_convrot(
                                 b_orig_dev = original_bias.to(device=dev, dtype=COMPUTE_DTYPE)
                                 weight_error = W_orig_dev - W_dequant_dev
                                 output_error = X_calib_dev @ weight_error.T
-                                bias_correction = output_error.mean(dim=0)
+                                # Outlier-robust 5% trimmed mean bias correction
+                                sorted_err, _ = output_error.sort(dim=0)
+                                trim_n = max(1, int(sorted_err.shape[0] * 0.05))
+                                if sorted_err.shape[0] > 2 * trim_n:
+                                    trimmed_err = sorted_err[trim_n:-trim_n]
+                                else:
+                                    trimmed_err = sorted_err
+                                bias_correction = trimmed_err.mean(dim=0)
                                 b_new = b_orig_dev - bias_correction
                                 res_tensors[bias_key] = b_new.to(device="cpu", dtype=original_bias.dtype)
-                                del (W_orig_dev, W_dequant_dev, X_calib_dev, b_orig_dev, weight_error, output_error, bias_correction, b_new)
+                                del (W_orig_dev, W_dequant_dev, X_calib_dev, b_orig_dev, weight_error, output_error, sorted_err, trimmed_err, bias_correction, b_new)
                                 if str(dev).startswith("cuda"):
                                     torch.cuda.empty_cache()
                                 break

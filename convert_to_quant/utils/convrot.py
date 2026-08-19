@@ -202,3 +202,24 @@ def find_max_compatible_group_size(in_features: int, min_group_size: int = 256) 
         return group_size
     return None
 
+
+def balance_channels_smoothquant(
+    weight: torch.Tensor,
+    x_calib: torch.Tensor,
+    alpha: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perform SmoothQuant per-channel scale balancing prior to Hadamard rotation.
+
+    s_c = max(|X_c|)^alpha / max(|W_c|)^(1-alpha)
+    Returns: (weight_balanced, smooth_scales)
+    """
+    with torch.no_grad():
+        act_max = x_calib.abs().amax(dim=0).clamp_min(1e-5)
+        weight_max = weight.abs().amax(dim=0).clamp_min(1e-5)
+        scales = (act_max.pow(alpha) / weight_max.pow(1.0 - alpha)).clamp_min(1e-5)
+        scales = scales / scales.mean()
+        weight_balanced = weight * scales.unsqueeze(0)
+    return weight_balanced, scales
+
+

@@ -215,7 +215,7 @@ def get_parser() -> MultiHelpArgumentParser:
     parser.add_argument("--extract-lora", "--extract_lora", action="store_true", dest="extract_lora", help="Extract quantization error into separate LoRA adapter layers.")
     parser.add_argument("--lora-rank", "--lora_rank", type=int, default=32, dest="lora_rank", help="Rank for extracted LoRA layers.")
     parser.add_argument("--lora-target", "--lora_target", type=str, default=None, dest="lora_target", help="Regex pattern for LoRA target layers.")
-    parser.add_argument("--lora-depth", "--lora_depth", type=int, default=1, dest="lora_depth", help="Maximum block depth for LoRA extraction.")
+    parser.add_argument("--lora-depth", "--lora_depth", type=int, default=-1, dest="lora_depth", help="Maximum block depth for LoRA extraction (default: -1 for all blocks).")
     parser.add_argument("--lora-ar-threshold", "--lora_ar_threshold", type=float, default=0.0, dest="lora_ar_threshold", help="Aspect ratio threshold for LoRA extraction.")
     parser.add_argument("--lora-output", "--lora_output", type=str, default=None, dest="lora_output", help="Path to save extracted LoRA adapter.")
     parser.add_argument("--convert-int4", "--convert-int4-to-comfy-quant", action="store_true", dest="convert_int4", help="Convert INT4 model to comfy_quant format.")

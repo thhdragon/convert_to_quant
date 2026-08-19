@@ -171,14 +171,22 @@ class QuantCheckpointManager:
 
         layer_entry = self.state["completed_layers"][key]
         tensors_file = layer_entry["tensors_file"]
+        lora_tensors_file = layer_entry.get("lora_tensors_file")
 
         try:
             tensors = load_file(tensors_file)
+            lora_tensors = {}
+            if lora_tensors_file and os.path.exists(lora_tensors_file):
+                try:
+                    lora_tensors = load_file(lora_tensors_file)
+                except Exception as e:
+                    warning(f"Could not load LoRA checkpoint file '{lora_tensors_file}': {e}")
+
             return {
                 "key": key,
                 "base_name": layer_entry.get("base_name"),
                 "tensors": tensors,
-                "lora_tensors": {},
+                "lora_tensors": lora_tensors,
                 "meta_entry": layer_entry.get("meta_entry"),
                 "skipped": layer_entry.get("skipped", False),
                 "use_custom": layer_entry.get("use_custom", False),
@@ -209,6 +217,12 @@ class QuantCheckpointManager:
         if tensors:
             save_file(tensors, ckpt_file)
 
+        lora_tensors = result.get("lora_tensors", {})
+        lora_ckpt_file = None
+        if lora_tensors:
+            lora_ckpt_file = os.path.join(self.checkpoint_dir, f"{safe_name}_lora.safetensors")
+            save_file(lora_tensors, lora_ckpt_file)
+
         base_name = result.get("base_name")
         meta_entry = result.get("meta_entry")
 
@@ -216,6 +230,7 @@ class QuantCheckpointManager:
             "status": "completed",
             "base_name": base_name,
             "tensors_file": ckpt_file,
+            "lora_tensors_file": lora_ckpt_file,
             "meta_entry": meta_entry,
             "skipped": result.get("skipped", False),
             "use_custom": result.get("use_custom", False),
@@ -241,6 +256,7 @@ class QuantCheckpointManager:
         """
         info(f"Assembling final output tensors into: {self.output_file}")
         all_tensors: Dict[str, torch.Tensor] = {}
+        assembled_lora: Dict[str, torch.Tensor] = dict(lora_tensors or {})
 
         # 1. Load all layer checkpoints
         for key, layer_entry in self.state["completed_layers"].items():
@@ -252,6 +268,14 @@ class QuantCheckpointManager:
                 except Exception as e:
                     error(f"Failed loading checkpoint file '{ckpt_file}': {e}")
                     return False
+
+            lora_ckpt_file = layer_entry.get("lora_tensors_file")
+            if lora_ckpt_file and os.path.exists(lora_ckpt_file):
+                try:
+                    loaded_lora = load_file(lora_ckpt_file)
+                    assembled_lora.update(loaded_lora)
+                except Exception as e:
+                    warning(f"Failed loading LoRA checkpoint file '{lora_ckpt_file}': {e}")
 
         # 2. Add passthrough tensors (bias, norms, embeddings)
         all_tensors.update(passthrough_tensors)
@@ -274,10 +298,12 @@ class QuantCheckpointManager:
                 save_file(all_tensors, self.output_file, **save_kwargs)
 
             # Save LoRA adapter if present
-            if lora_tensors:
+            if assembled_lora:
                 target_lora_path = lora_save_path or self.output_file.replace(".safetensors", "_lora.safetensors")
-                info(f"Saving {len(lora_tensors)} extracted LoRA tensors to: {target_lora_path}")
-                save_file(lora_tensors, target_lora_path)
+                info(f"Saving {len(assembled_lora)} extracted LoRA tensors to: {target_lora_path}")
+                save_file(assembled_lora, target_lora_path)
+            elif lora_save_path:
+                warning(f"LoRA extraction was requested ('{lora_save_path}'), but no LoRA tensors met the extraction criteria.")
 
             # Mark state completed and clean up checkpoint directory
             self.state["status"] = "completed"
