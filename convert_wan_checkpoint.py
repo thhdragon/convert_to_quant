@@ -364,8 +364,26 @@ def cmd_convert(args):
     converted = convert_tensors(tensors, direction, keep_prefix=not args.strip_prefix)
 
     out_file = out_dir / "model.safetensors"
-    print(f"Writing merged checkpoint ({len(converted)} tensors) to {out_file} ...")
-    save_file(converted, str(out_file), metadata={"format": "pt"})
+
+    if getattr(args, "sharded", False) or getattr(args, "max_shard_size", None):
+        try:
+            from convert_to_quant.utils.checkpoint import QuantCheckpointManager
+            mgr = QuantCheckpointManager(
+                output_file=str(out_file),
+                input_file=str(in_path),
+                primary_format="wan",
+                max_shard_size=getattr(args, "max_shard_size", None),
+                sharded=True,
+                no_checkpoint=True,
+            )
+            mgr.assemble_final_output(converted, original_metadata={"format": "pt"})
+        except Exception as e:
+            print(f"Sharded saving fallback: {e}")
+            print(f"Writing merged checkpoint ({len(converted)} tensors) to {out_file} ...")
+            save_file(converted, str(out_file), metadata={"format": "pt"})
+    else:
+        print(f"Writing merged checkpoint ({len(converted)} tensors) to {out_file} ...")
+        save_file(converted, str(out_file), metadata={"format": "pt"})
     print("Done.")
 
 
@@ -392,6 +410,21 @@ def main():
         help="Drop any detected training-wrapper prefix (e.g. 'model.', '_fsdp_wrapped_module.') "
              "instead of preserving it on the converted keys. Recommended for checkpoints you plan "
              "to load into a normal inference pipeline rather than resume training on.",
+    )
+    p_convert.add_argument(
+        "--sharded",
+        "--keep-shards",
+        action="store_true",
+        dest="sharded",
+        help="Enable sharded output saving using multiple safetensors shards and index JSON. "
+             "Disabled by default (outputs single merged file unless enabled).",
+    )
+    p_convert.add_argument(
+        "--max-shard-size",
+        type=str,
+        default=None,
+        dest="max_shard_size",
+        help="Maximum size per output safetensors shard (e.g. '5GB', '2000MB'). Implies --sharded.",
     )
     p_convert.set_defaults(func=cmd_convert)
 

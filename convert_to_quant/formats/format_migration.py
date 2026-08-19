@@ -423,7 +423,9 @@ def scan_and_replace_comfy_quant_metadata(
         ".scale_input",
         ".per_tensor_scale",
         "._s_rel",
+        ".weight_s_rel",
         "._s_channel",
+        ".weight_s_channel",
         "._codebook",
         "._correction",
     )
@@ -458,7 +460,11 @@ def scan_and_replace_comfy_quant_metadata(
         weight_scale = (
             layer_data.get("weight_scale")
             if layer_data.get("weight_scale") is not None
-            else layer_data.get("scale_weight")
+            else (
+                layer_data.get("scale_weight")
+                if layer_data.get("scale_weight") is not None
+                else (layer_data.get("_s_rel") if layer_data.get("_s_rel") is not None else layer_data.get("weight_s_rel"))
+            )
         )
         input_scale = (
             layer_data.get("input_scale")
@@ -498,6 +504,18 @@ def scan_and_replace_comfy_quant_metadata(
             # Standardize scale tensors
             if weight_scale is not None:
                 output_tensors[f"{base_name}.weight_scale"] = weight_scale
+                if layer_data.get("_s_rel") is not None or layer_data.get("weight_s_rel") is not None:
+                    s_rel_val = layer_data.get("_s_rel") if layer_data.get("_s_rel") is not None else layer_data.get("weight_s_rel")
+                    output_tensors[f"{base_name}._s_rel"] = s_rel_val
+                    output_tensors[f"{base_name}.weight_s_rel"] = s_rel_val.detach().clone()
+                else:
+                    output_tensors[f"{base_name}._s_rel"] = weight_scale.detach().clone()
+                    output_tensors[f"{base_name}.weight_s_rel"] = weight_scale.detach().clone()
+
+            s_chan_val = layer_data.get("_s_channel") if layer_data.get("_s_channel") is not None else layer_data.get("weight_s_channel")
+            if s_chan_val is not None:
+                output_tensors[f"{base_name}._s_channel"] = s_chan_val
+                output_tensors[f"{base_name}.weight_s_channel"] = s_chan_val.detach().clone()
             if input_scale is not None:
                 output_tensors[f"{base_name}.input_scale"] = input_scale
             elif include_input_scale:
@@ -522,7 +540,10 @@ def scan_and_replace_comfy_quant_metadata(
                     is_convrot_layer = True
                 elif existing_fmt in ("w4a8_int8", "asym_w4a8_int8", "w4a8", "asymw4a8int8layout"):
                     is_w4a8_layer = True
-            elif layer_data.get("_s_rel") is not None and layer_data.get("_s_channel") is not None:
+            elif (
+                (layer_data.get("_s_rel") is not None or layer_data.get("weight_s_rel") is not None)
+                and (layer_data.get("_s_channel") is not None or layer_data.get("weight_s_channel") is not None)
+            ):
                 is_w4a8_layer = True
 
             if existing_config:

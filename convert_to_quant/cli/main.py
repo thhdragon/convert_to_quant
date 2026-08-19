@@ -263,12 +263,30 @@ def get_parser() -> MultiHelpArgumentParser:
         help="Custom path for the sidecar progress JSON file.",
     )
     parser.add_argument(
+        "--sharded",
+        "--save-sharded",
+        "--save_sharded",
+        action="store_true",
+        default=False,
+        dest="sharded",
+        help="Enable sharded tensor saving (disabled by default; outputs single merged file unless enabled).",
+    )
+    parser.add_argument(
         "--max-shard-size",
         "--max_shard_size",
         type=str,
         default=None,
         dest="max_shard_size",
-        help="Maximum size per output safetensors shard (e.g. '5GB', '2000MB').",
+        help="Maximum size per output safetensors shard (e.g. '5GB', '2000MB'). Implies --sharded.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        "--enable-checkpoint",
+        "--enable_checkpoint",
+        action="store_true",
+        default=False,
+        dest="checkpoint",
+        help="Enable per-layer checkpoint folder saving and progress tracking (disabled by default).",
     )
     parser.add_argument(
         "--no-checkpoint",
@@ -1086,6 +1104,10 @@ def run_conversion(args):
     # Set pinned memory verbosity
     set_pinned_verbose(args.verbose_pinned)
 
+    # Disable per-layer checkpointing by default unless explicitly requested via --checkpoint, --resume, or --sidecar-path
+    if not getattr(args, "checkpoint", False) and not getattr(args, "resume", False) and not getattr(args, "sidecar_path", None):
+        args.no_checkpoint = True
+
     actcal_scales = None
 
     # Dry-run modes are separate workflows and must return before any conversion.
@@ -1317,6 +1339,7 @@ def run_conversion(args):
                 resume=args.resume,
                 sidecar_path=args.sidecar_path,
                 max_shard_size=args.max_shard_size,
+                sharded=args.sharded,
                 no_checkpoint=args.no_checkpoint,
             )
             return
@@ -1438,6 +1461,7 @@ def run_conversion(args):
                 resume=args.resume,
                 sidecar_path=args.sidecar_path,
                 max_shard_size=args.max_shard_size,
+                sharded=args.sharded,
                 no_checkpoint=args.no_checkpoint,
             )
             return
@@ -1518,6 +1542,7 @@ def run_conversion(args):
                 resume=args.resume,
                 sidecar_path=args.sidecar_path,
                 max_shard_size=args.max_shard_size,
+                sharded=args.sharded,
                 no_checkpoint=args.no_checkpoint,
             )
             return
@@ -1880,6 +1905,7 @@ def run_conversion(args):
         resume=args.resume,
         sidecar_path=args.sidecar_path,
         max_shard_size=args.max_shard_size,
+        sharded=args.sharded,
         no_checkpoint=args.no_checkpoint,
     )
 

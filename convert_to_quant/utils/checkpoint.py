@@ -75,13 +75,20 @@ class QuantCheckpointManager:
         resume: bool = False,
         sidecar_path: Optional[str] = None,
         max_shard_size: Optional[Union[str, int]] = None,
-        no_checkpoint: bool = False,
+        sharded: bool = False,
+        no_checkpoint: bool = True,
     ):
         self.output_file = os.path.abspath(output_file)
         self.input_file = os.path.abspath(input_file)
         self.primary_format = primary_format
         self.disabled = no_checkpoint
-        self.max_shard_size_bytes = parse_shard_size(max_shard_size)
+
+        if max_shard_size is not None:
+            self.max_shard_size_bytes = parse_shard_size(max_shard_size)
+        elif sharded:
+            self.max_shard_size_bytes = parse_shard_size("5GB")
+        else:
+            self.max_shard_size_bytes = None
 
         out_dir = os.path.dirname(self.output_file) or "."
         os.makedirs(out_dir, exist_ok=True)
@@ -232,6 +239,7 @@ class QuantCheckpointManager:
         self,
         passthrough_tensors: Dict[str, torch.Tensor],
         original_metadata: Optional[Dict[str, str]] = None,
+        quant_metadata_layers: Optional[Dict[str, Any]] = None,
         lora_tensors: Optional[Dict[str, torch.Tensor]] = None,
         lora_save_path: Optional[str] = None,
     ) -> bool:
@@ -258,7 +266,9 @@ class QuantCheckpointManager:
 
         # 3. Prepare metadata
         output_metadata = dict(original_metadata or {})
-        quant_meta = self.state.get("quant_metadata_layers", {})
+        quant_meta = dict(self.state.get("quant_metadata_layers", {}))
+        if quant_metadata_layers:
+            quant_meta.update(quant_metadata_layers)
         if quant_meta:
             full_metadata = {"format_version": "1.0", "layers": quant_meta}
             output_metadata["_quantization_metadata"] = json.dumps(full_metadata)

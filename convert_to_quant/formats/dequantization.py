@@ -128,7 +128,11 @@ def dequantize_model(
         weight_scale = (
             data.get("weight_scale")
             if data.get("weight_scale") is not None
-            else (data.get("scale_weight") if data.get("scale_weight") is not None else data.get("_s_rel"))
+            else (
+                data.get("scale_weight")
+                if data.get("scale_weight") is not None
+                else (data.get("_s_rel") if data.get("_s_rel") is not None else data.get("weight_s_rel"))
+            )
         )
         per_tensor_scale = data.get("per_tensor_scale")
 
@@ -143,7 +147,9 @@ def dequantize_model(
                     "scale_input",
                     "per_tensor_scale",
                     "_s_rel",
+                    "weight_s_rel",
                     "_s_channel",
+                    "weight_s_channel",
                     "_correction",
                     "_codebook",
                 ):
@@ -203,8 +209,16 @@ def dequantize_model(
                             output_dtype=target_dtype,
                         )
                 elif fmt in ("w4a8_int8", "asym_w4a8_int8", "w4a8", "AsymW4A8Int8Layout"):
-                    s_rel = weight_scale
-                    s_channel = data.get("_s_channel")
+                    s_rel = (
+                        data.get("weight_s_rel")
+                        if data.get("weight_s_rel") is not None
+                        else (data.get("_s_rel") if data.get("_s_rel") is not None else weight_scale)
+                    )
+                    s_channel = (
+                        data.get("_s_channel")
+                        if data.get("_s_channel") is not None
+                        else data.get("weight_s_channel")
+                    )
                     codebook = data.get("_codebook")
                     correction = data.get("_correction")
                     if s_rel is not None and s_channel is not None:

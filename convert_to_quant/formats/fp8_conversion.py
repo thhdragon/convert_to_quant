@@ -81,7 +81,8 @@ def convert_to_fp8_scaled(
     resume: bool = False,
     sidecar_path: Optional[str] = None,
     max_shard_size: Optional[Union[str, int]] = None,
-    no_checkpoint: bool = False,
+    sharded: bool = False,
+    no_checkpoint: bool = True,
     **converter_kwargs,
 ):
     # Ensure filter_flags is a dict
@@ -111,6 +112,7 @@ def convert_to_fp8_scaled(
         resume=resume,
         sidecar_path=sidecar_path,
         max_shard_size=max_shard_size,
+        sharded=sharded,
         no_checkpoint=no_checkpoint,
     )
 
@@ -638,8 +640,13 @@ def convert_to_fp8_scaled(
             block_size_for_meta = None
 
             if is_w4a8:
-                res_tensors[f"{base_name}.weight_scale"] = s_rel.to(device="cpu")
-                res_tensors[f"{base_name}._s_channel"] = s_channel.to(device="cpu")
+                s_rel_cpu = s_rel.to(device="cpu")
+                s_chan_cpu = s_channel.to(device="cpu")
+                res_tensors[f"{base_name}._s_rel"] = s_rel_cpu
+                res_tensors[f"{base_name}.weight_s_rel"] = s_rel_cpu.detach().clone()
+                res_tensors[f"{base_name}.weight_scale"] = s_rel_cpu.detach().clone()
+                res_tensors[f"{base_name}._s_channel"] = s_chan_cpu
+                res_tensors[f"{base_name}.weight_s_channel"] = s_chan_cpu.detach().clone()
                 if correction is not None:
                     res_tensors[f"{base_name}._correction"] = correction.to(device="cpu")
                 if codebook is not None:
@@ -738,14 +745,14 @@ def convert_to_fp8_scaled(
             meta_entry = None
             if quant_metadata_layers is not None:
                 meta_entry = {"format": comfy_quant_format}
-                block_based_formats = {"int8_blockwise", "float8_e4m3fn_blockwise", "mxfp8", "nvfp4", "convrot_w4a4"}
+                block_based_formats = {"int8_blockwise", "float8_e4m3fn_blockwise", "mxfp8", "nvfp4", "convrot_w4a4", "w4a8_int8", "asym_w4a8_int8", "w4a8"}
                 if block_size_for_meta is not None and comfy_quant_format in block_based_formats:
                     meta_entry["group_size"] = block_size_for_meta
                 if layer_full_precision_mm:
                     meta_entry["full_precision_matrix_mult"] = True
-                if is_int4 or convrot_applied:
+                if is_int4 or convrot_applied or is_w4a8:
                     meta_entry["convrot"] = True
-                    meta_entry["convrot_groupsize"] = convrot_group_size if convrot_applied else 256
+                    meta_entry["convrot_groupsize"] = getattr(converter, "convrot_groupsize", convrot_group_size if convrot_applied else 256)
 
         else:
             res_tensors[f"{base_name}.scale_weight"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
@@ -912,6 +919,7 @@ def convert_to_fp8_scaled(
     success = checkpoint_mgr.assemble_final_output(
         passthrough_tensors=passthrough_tensors,
         original_metadata=original_metadata,
+        quant_metadata_layers=quant_metadata_layers,
         lora_tensors=lora_tensors,
         lora_save_path=lora_save_path or lora_output,
     )

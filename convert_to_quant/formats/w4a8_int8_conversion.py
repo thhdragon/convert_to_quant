@@ -127,11 +127,11 @@ def convert_w4a8_int8_to_comfy_quant(
         if key.endswith(".weight"):
             base = key[: -len(".weight")]
             layer_info.setdefault(base, {})["weight"] = tensor
-        elif key.endswith(".weight_scale") or key.endswith("._s_rel"):
+        elif key.endswith(".weight_scale") or key.endswith("._s_rel") or key.endswith(".weight_s_rel"):
             base = key.rsplit(".", 1)[0]
             layer_info.setdefault(base, {})["s_rel"] = tensor
-        elif key.endswith("._s_channel"):
-            base = key[: -len("._s_channel")]
+        elif key.endswith("._s_channel") or key.endswith(".weight_s_channel"):
+            base = key.rsplit(".", 1)[0]
             layer_info.setdefault(base, {})["s_channel"] = tensor
         elif key.endswith("._codebook"):
             base = key[: -len("._codebook")]
@@ -151,6 +151,17 @@ def convert_w4a8_int8_to_comfy_quant(
 
         for k, v in layer_data.items():
             output_tensors[f"{base_name}.{k}"] = v
+
+        if "s_rel" in layer_data:
+            s_rel_t = layer_data["s_rel"].to(device="cpu")
+            output_tensors[f"{base_name}._s_rel"] = s_rel_t
+            output_tensors[f"{base_name}.weight_s_rel"] = s_rel_t.detach().clone()
+            output_tensors[f"{base_name}.weight_scale"] = s_rel_t.detach().clone()
+
+        if "s_channel" in layer_data:
+            s_chan_t = layer_data["s_channel"].to(device="cpu")
+            output_tensors[f"{base_name}._s_channel"] = s_chan_t
+            output_tensors[f"{base_name}.weight_s_channel"] = s_chan_t.detach().clone()
 
         comfy_quant_tensor = create_comfy_quant_tensor(
             "asym_w4a8_int8",
