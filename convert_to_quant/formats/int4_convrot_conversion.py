@@ -41,6 +41,7 @@ def convert_to_int4_convrot(
     dynamic_convrot: bool = False,
     w4a4_untouched_activations: bool = False,
     full_precision_matrix_mult: bool = False,
+    custom_full_precision_mm: bool = False,
     skip_inefficient_layers: bool = False,
     no_learned_rounding: bool = False,
     save_quant_metadata: bool = True,
@@ -232,7 +233,8 @@ def convert_to_int4_convrot(
                 original_tensor = loader.get_tensor(key)
                 return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=original_tensor.dtype)}}
 
-        if custom_pattern and custom_pattern.search(key):
+        base_name = key[: key.rfind(".weight")] if key.endswith(".weight") else key
+        if custom_pattern and (custom_pattern.search(key) or custom_pattern.search(base_name)):
             use_custom = True
 
         if not use_custom and exclude_pattern and exclude_pattern.search(key):
@@ -335,11 +337,12 @@ def convert_to_int4_convrot(
         res_tensors[key] = q_tensor.to(device="cpu")
         bias_key = f"{base_name}.bias"
 
+        layer_fpmm = full_precision_matrix_mult or (use_custom and custom_full_precision_mm)
         res_tensors[f"{base_name}.weight_scale"] = dequant_s.to(device="cpu", dtype=SCALE_DTYPE).detach().clone()
         comfy_quant_tensor = create_comfy_quant_tensor(
             "convrot_w4a4",
             block_size=block_size,
-            full_precision_matrix_mult=full_precision_matrix_mult if full_precision_matrix_mult else None,
+            full_precision_matrix_mult=layer_fpmm if layer_fpmm else None,
             convrot=True,
             convrot_groupsize=convrot_group_size_layer,
         )
@@ -351,7 +354,7 @@ def convert_to_int4_convrot(
             "convrot": True,
             "convrot_groupsize": convrot_group_size_layer,
         }
-        if full_precision_matrix_mult:
+        if layer_fpmm:
             meta_entry["full_precision_matrix_mult"] = True
 
         if "bias_correction" in extra_tensors:

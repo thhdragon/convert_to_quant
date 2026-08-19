@@ -128,7 +128,7 @@ MODEL_FILTERS = {
     "t5xxl": {"help": "T5-XXL text encoder", "category": "text", "exclude": AVOID_KEY_NAMES, "remove": T5XXL_REMOVE_KEY_NAMES},
     "mistral": {"help": "Mistral text encoder", "category": "text", "exclude": AVOID_KEY_NAMES},
     "visual": {"help": "Visual encoder", "category": "text", "exclude": VISUAL_AVOID_KEY_NAMES},
-    "generic_text": {"help": "Generic text encoder", "category": "text"},
+    "generic_text": {"help": "Generic text encoder: emit input scales for supported runtimes", "category": "text"},
     "flux1": {"help": "Flux.1 model", "category": "diffusion", "highprec": FLUX1_LAYER_KEYNAMES},
     "anima": {"help": "Anima model", "category": "diffusion", "highprec": ANIMA_LAYER_KEYNAMES},
     "lens": {"help": "LENS model", "category": "diffusion", "highprec": LENS_LAYER_KEYNAMES},

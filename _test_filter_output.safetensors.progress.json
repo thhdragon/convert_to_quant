@@ -9,16 +9,8 @@
       "status": "completed",
       "base_name": null,
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/decoder.block.0.attn.weight.safetensors",
-      "meta_entry": {
-        "format": "nvfp4",
-        "group_size": 16,
-        "orig_dtype": "torch.float32",
-        "orig_shape": [
-          64,
-          64
-        ]
-      },
-      "skipped": false,
+      "meta_entry": null,
+      "skipped": true,
       "use_custom": false,
       "use_fallback": false,
       "use_layer_config": false
@@ -35,16 +27,13 @@
     },
     "final_layer.linear.weight": {
       "status": "completed",
-      "base_name": null,
+      "base_name": "final_layer.linear",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/final_layer.linear.weight.safetensors",
       "meta_entry": {
-        "format": "nvfp4",
-        "group_size": 16,
-        "orig_dtype": "torch.float32",
-        "orig_shape": [
-          64,
-          64
-        ]
+        "format": "convrot_w4a4",
+        "group_size": 64,
+        "convrot": true,
+        "convrot_groupsize": 256
       },
       "skipped": false,
       "use_custom": false,
@@ -171,16 +160,13 @@
     },
     "net.blocks.0.attn.weight": {
       "status": "completed",
-      "base_name": null,
+      "base_name": "net.blocks.0.attn",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/net.blocks.0.attn.weight.safetensors",
       "meta_entry": {
-        "format": "nvfp4",
-        "group_size": 16,
-        "orig_dtype": "torch.float32",
-        "orig_shape": [
-          64,
-          64
-        ]
+        "format": "convrot_w4a4",
+        "group_size": 64,
+        "convrot": true,
+        "convrot_groupsize": 256
       },
       "skipped": false,
       "use_custom": false,
@@ -189,16 +175,13 @@
     },
     "net.blocks.1.adaln_modulation.weight": {
       "status": "completed",
-      "base_name": null,
+      "base_name": "net.blocks.1.adaln_modulation",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/net.blocks.1.adaln_modulation.weight.safetensors",
       "meta_entry": {
-        "format": "nvfp4",
-        "group_size": 16,
-        "orig_dtype": "torch.float32",
-        "orig_shape": [
-          64,
-          64
-        ]
+        "format": "convrot_w4a4",
+        "group_size": 64,
+        "convrot": true,
+        "convrot_groupsize": 256
       },
       "skipped": false,
       "use_custom": false,
@@ -243,16 +226,13 @@
     },
     "transformer.blocks.2.attn.proj.weight": {
       "status": "completed",
-      "base_name": null,
+      "base_name": "transformer.blocks.2.attn.proj",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/transformer.blocks.2.attn.proj.weight.safetensors",
       "meta_entry": {
-        "format": "nvfp4",
-        "group_size": 16,
-        "orig_dtype": "torch.float32",
-        "orig_shape": [
-          64,
-          64
-        ]
+        "format": "convrot_w4a4",
+        "group_size": 64,
+        "convrot": true,
+        "convrot_groupsize": 256
       },
       "skipped": false,
       "use_custom": false,
@@ -261,16 +241,13 @@
     },
     "transformer.blocks.2.attn.qkv.weight": {
       "status": "completed",
-      "base_name": null,
+      "base_name": "transformer.blocks.2.attn.qkv",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/transformer.blocks.2.attn.qkv.weight.safetensors",
       "meta_entry": {
-        "format": "nvfp4",
-        "group_size": 16,
-        "orig_dtype": "torch.float32",
-        "orig_shape": [
-          64,
-          64
-        ]
+        "format": "convrot_w4a4",
+        "group_size": 64,
+        "convrot": true,
+        "convrot_groupsize": 256
       },
       "skipped": false,
       "use_custom": false,
@@ -279,16 +256,13 @@
     },
     "transformer.blocks.2.mlp.fc1.weight": {
       "status": "completed",
-      "base_name": null,
+      "base_name": "transformer.blocks.2.mlp.fc1",
       "tensors_file": "/home/tyler/Documents/int4ctq/_test_filter_output.safetensors.checkpoint/transformer.blocks.2.mlp.fc1.weight.safetensors",
       "meta_entry": {
-        "format": "nvfp4",
-        "group_size": 16,
-        "orig_dtype": "torch.float32",
-        "orig_shape": [
-          128,
-          64
-        ]
+        "format": "convrot_w4a4",
+        "group_size": 64,
+        "convrot": true,
+        "convrot_groupsize": 256
       },
       "skipped": false,
       "use_custom": false,
@@ -372,5 +346,54 @@
       "use_layer_config": false
     }
   },
-  "quant_metadata_layers": {}
+  "quant_metadata_layers": {
+    "decoder.block.0.attn": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    },
+    "lm_head.proj": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    },
+    "transformer.blocks.2.attn.proj": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    },
+    "transformer.blocks.2.attn.qkv": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    },
+    "transformer.blocks.2.mlp.fc1": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    },
+    "final_layer.linear": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    },
+    "net.blocks.0.attn": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    },
+    "net.blocks.1.adaln_modulation": {
+      "format": "convrot_w4a4",
+      "group_size": 64,
+      "convrot": true,
+      "convrot_groupsize": 256
+    }
+  }
 }

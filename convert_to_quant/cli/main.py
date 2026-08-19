@@ -292,6 +292,7 @@ def run_conversion(args) -> None:
         dynamic_convrot=args.dynamic_convrot,
         w4a4_untouched_activations=getattr(args, "w4a4_untouched_activations", False),
         full_precision_matrix_mult=args.full_precision_matrix_mult,
+        custom_full_precision_mm=getattr(args, "custom_full_precision_mm", False),
         skip_inefficient_layers=args.heur,
         no_learned_rounding=args.simple,
         layer_config=layer_config_data,

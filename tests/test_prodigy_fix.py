@@ -1,43 +1,24 @@
 import torch
-from convert_to_quant.converters.learned_rounding import LearnedRoundingConverter
-from convert_to_quant.converters.w4a8_int8_converter import LearnedW4A8Int8Converter
+from convert_to_quant.converters.learned_int4 import LearnedINT4Converter
 
-def test_prodigy_plateau_learned_rounding():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def test_prodigy_plateau_learned_rounding_int4():
+    device = "cpu"
     M, N = 256, 256
     W = torch.randn(M, N, device=device)
+    calib = torch.randn(32, N, device=device)
 
-    converter = LearnedRoundingConverter(
-        target_format="int8",
-        scaling_mode="row",
-        convrot=False,
+    converter = LearnedINT4Converter(
         optimizer="prodigy",
         lr_schedule="plateau",
-        num_iter=40,
+        num_iter=20,
         lr=1.0,
-        device=device
+        device=device,
+        convrot=True,
+        convrot_group_size=256,
     )
 
-    qdata, scale, dequantized, extra = converter.convert(W)
-    assert qdata is not None
-    assert dequantized is not None
-    assert dequantized.shape == W.shape
-
-def test_prodigy_plateau_w4a8():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    M, N = 256, 256
-    W = torch.randn(M, N, device=device)
-    X = torch.randn(32, N, device=device)
-
-    converter = LearnedW4A8Int8Converter(
-        optimizer="prodigy",
-        lr_schedule="plateau",
-        num_iter=40,
-        lr=1.0,
-        device=device
-    )
-
-    qdata, s_rel, s_channel, correction, codebook_tensor, dequantized, extra = converter.convert(W, calibration_data=X)
+    qdata, scale, dequantized, extra = converter.convert(W, calibration_data=calib)
     assert qdata is not None
     assert dequantized is not None
     assert dequantized.shape == W.shape

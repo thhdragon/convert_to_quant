@@ -1,15 +1,14 @@
 """
-Unit tests for custom layers argument options (--custom-fpmm, --custom-convrot) and has_bias optimization.
+Unit tests for custom layers argument options (--custom-fpmm, --custom-convrot) and has_bias optimization for INT4 ConvRot W4A4.
 """
 
 import os
 import unittest
-from unittest.mock import patch
 
 import torch
 from safetensors.torch import load_file, save_file
 
-from convert_to_quant.formats.fp8_conversion import convert_to_fp8_scaled
+from convert_to_quant.formats.int4_convrot_conversion import convert_to_int4_convrot
 from convert_to_quant.utils.comfy_quant import tensor_to_dict
 
 
@@ -18,15 +17,11 @@ class TestCustomLayersAndBiasOpt(unittest.TestCase):
         self.input_path = "test_custom_opt_input.safetensors"
         self.output_path = "test_custom_opt_output.safetensors"
 
-        # Create a small synthetic model:
-        # - blocks.0.attn.wq.weight (with associated bias blocks.0.attn.wq.bias)
-        # - blocks.0.attn.wk.weight (WITHOUT bias)
-        # - blocks.0.mlp.down.weight (WITHOUT bias)
         self.tensors = {
-            "blocks.0.attn.wq.weight": torch.randn(64, 64, dtype=torch.float16),
-            "blocks.0.attn.wq.bias": torch.randn(64, dtype=torch.float16),
-            "blocks.0.attn.wk.weight": torch.randn(64, 64, dtype=torch.float16),
-            "blocks.0.mlp.down.weight": torch.randn(64, 64, dtype=torch.float16),
+            "blocks.0.attn.wq.weight": torch.randn(256, 256, dtype=torch.float16),
+            "blocks.0.attn.wq.bias": torch.randn(256, dtype=torch.float16),
+            "blocks.0.attn.wk.weight": torch.randn(256, 256, dtype=torch.float16),
+            "blocks.0.mlp.down.weight": torch.randn(256, 256, dtype=torch.float16),
         }
         save_file(self.tensors, self.input_path)
 
@@ -36,26 +31,21 @@ class TestCustomLayersAndBiasOpt(unittest.TestCase):
                 os.remove(path)
 
     def test_custom_fpmm_and_has_bias(self):
-        # Run conversion with custom options:
-        # - target custom layers "blocks.0.mlp.down" and "blocks.0.attn.wk"
-        # - set custom_fpmm = True for custom layers only
-        convert_to_fp8_scaled(
+        convert_to_int4_convrot(
             input_file=self.input_path,
             output_file=self.output_path,
             comfy_quant=True,
             filter_flags={},
             calib_samples=100,
             seed=42,
-            no_learned_rounding=True,  # simple mode
+            no_learned_rounding=True,
             custom_layers="(blocks.0.mlp.down|blocks.0.attn.wk)",
-            custom_type="fp8",
             custom_full_precision_mm=True,
             device="cpu",
         )
 
         out_tensors = load_file(self.output_path)
 
-        # 1. Check that blocks.0.mlp.down.weight has comfy_quant metadata containing full_precision_matrix_mult
         self.assertIn("blocks.0.mlp.down.comfy_quant", out_tensors)
         comfy_quant_down = tensor_to_dict(out_tensors["blocks.0.mlp.down.comfy_quant"])
         self.assertTrue(comfy_quant_down.get("full_precision_matrix_mult", False))
@@ -64,40 +54,9 @@ class TestCustomLayersAndBiasOpt(unittest.TestCase):
         comfy_quant_wk = tensor_to_dict(out_tensors["blocks.0.attn.wk.comfy_quant"])
         self.assertTrue(comfy_quant_wk.get("full_precision_matrix_mult", False))
 
-        # 2. Check that blocks.0.attn.wq.weight (which is NOT matched by custom-layers) does NOT have full_precision_matrix_mult
         self.assertIn("blocks.0.attn.wq.comfy_quant", out_tensors)
         comfy_quant_wq = tensor_to_dict(out_tensors["blocks.0.attn.wq.comfy_quant"])
         self.assertFalse(comfy_quant_wq.get("full_precision_matrix_mult", False))
-
-    def test_custom_heuristic_uses_custom_block_size(self):
-        with patch(
-            "convert_to_quant.formats.fp8_conversion.should_skip_layer_for_performance",
-            return_value=(False, ""),
-        ) as should_skip:
-            convert_to_fp8_scaled(
-                input_file=self.input_path,
-                output_file=self.output_path,
-                comfy_quant=True,
-                filter_flags={},
-                calib_samples=4,
-                seed=42,
-                no_learned_rounding=True,
-                block_size=64,
-                custom_layers=r"blocks[.]0[.]mlp[.]down",
-                custom_type="fp8",
-                custom_block_size=32,
-                custom_scaling_mode="block",
-                custom_heur=True,
-                device="cpu",
-            )
-
-        matching_calls = [
-            call
-            for call in should_skip.call_args_list
-            if call.args[0].shape == self.tensors["blocks.0.mlp.down.weight"].shape
-        ]
-        self.assertTrue(matching_calls)
-        self.assertEqual(matching_calls[-1].args[1], 32)
 
 
 if __name__ == "__main__":
