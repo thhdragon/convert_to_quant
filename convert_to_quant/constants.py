@@ -1,7 +1,7 @@
 """
 Constants and configuration values for convert_to_quant.
 
-Contains model-specific key name filters and dtype settings.
+Contains model-specific key name filters, dtype settings, and INT4 ConvRot constants.
 """
 
 import torch
@@ -50,7 +50,7 @@ VISUAL_AVOID_KEY_NAMES = [
     "patch_embed",
     "pos_embed",
     "merger",
-    "visual"
+    "visual",
 ]
 QWEN_AVOID_KEY_NAMES = ["norm_added_k", "norm_added_q", "norm_k", "norm_q", "txt_norm"]
 HUNYUAN_AVOID_KEY_NAMES = [
@@ -89,24 +89,10 @@ WAN_LAYER_KEYNAMES = [
     "trainable_cond_mask", "cond_encoder", "audio_model.time_embedding", "time_projection", "video_model.time_projection",
     "head.head", "face_encoder.out_proj", "face_adapter", "audio_injector"
 ]
-QWEN_LAYER_KEYNAMES = [
-    "time_text_embed",
-    "img_in",
-    "norm_out",
-    "proj_out",
-    # "transformer_blocks.0.img_mod.1",
-    "txt_in",
-]
+QWEN_LAYER_KEYNAMES = ["time_text_embed", "img_in", "norm_out", "proj_out", "txt_in"]
 ERNIE_IMAGE_LAYER_KEYNAMES = [
-    "time_embedding",
-    "adaLN_modulation",
-    "final_linear",
-    "final_norm",
-    "x_embedder",
-    "layers.0.self_attention",
-    "layers.0.mlp.gate_proj",
-    "layers.0.mlp.up_proj",
-    "text_proj",
+    "time_embedding", "adaLN_modulation", "final_linear", "final_norm", "x_embedder",
+    "layers.0.self_attention", "layers.0.mlp.gate_proj", "layers.0.mlp.up_proj", "text_proj"
 ]
 ZIMAGE_LAYER_KEYNAMES = [
     "x_embedder", "clip_text_pooled_proj", "final_layer", "cap_embedder.1", "adaLN_modulation", "t_embedder", "time_text_embed"
@@ -117,46 +103,18 @@ ANIMA_LAYER_KEYNAMES = [
 ]
 LENS_LAYER_KEYNAMES = ["time_text_embed", "img_in", "norm_out", "proj_out", "img_mod.1", "txt_mod.1", "txt_in"]
 QWEN35_AVOID_KEY_NAMES = [
-    ".layers.0.",
-    ".layers.23.",
-    ".layers.31.",
-    ".layers.63.",
-    "lm_head",
-    "embed_tokens",
-    "in_proj_a",
-    "in_proj_b",
-    "visual.",
-    "merger",
-    "mtp.fc",
+    ".layers.0.", ".layers.23.", ".layers.31.", ".layers.63.", "lm_head", "embed_tokens",
+    "in_proj_a", "in_proj_b", "visual.", "merger", "mtp.fc"
 ]
 LTXV2_LAYER_KEYNAMES = [
-    "scale_shift_table",
-    "text_embedding_projection",
-    "audio_vae",
-    "audio_embeddings_connector",
-    "adaln_single",
-    "audio_adaln_single",
-    "audio_patchify_proj",
-    "audio_proj_out",
-    "audio_prompt_adaln_single",
-    "av_ca_a2v_gate_adaln_single",
-    "av_ca_audio_scale_shift_adaln_single",
-    "av_ca_v2a_gate_adaln_single",
-    "av_ca_video_scale_shift_adaln_single",
-    "patchify_proj",
-    "proj_out",
-    "prompt_adaln_single",
-    "transformer_blocks.0.",
-    "transformer_blocks.1.",
-    "transformer_blocks.46.",
-    "transformer_blocks.47.",
-    "video_embeddings_connector",
-    "vae.decoder",
-    "vae.encoder",
-    "vocoder",
-    "to_gate_logits",
+    "scale_shift_table", "text_embedding_projection", "audio_vae", "audio_embeddings_connector",
+    "adaln_single", "audio_adaln_single", "audio_patchify_proj", "audio_proj_out",
+    "audio_prompt_adaln_single", "av_ca_a2v_gate_adaln_single", "av_ca_audio_scale_shift_adaln_single",
+    "av_ca_v2a_gate_adaln_single", "av_ca_video_scale_shift_adaln_single", "patchify_proj",
+    "proj_out", "prompt_adaln_single", "transformer_blocks.0.", "transformer_blocks.1.",
+    "transformer_blocks.46.", "transformer_blocks.47.", "video_embeddings_connector",
+    "vae.decoder", "vae.encoder", "vocoder", "to_gate_logits"
 ]
-
 KREA2_LAYER_KEYNAMES = ["firs", "las", "tml", "txtfusion", "last.modulatio", "tpro"]
 BOOGU_LAYER_KEYNAMES = [
     "image_index_embedding", "ref_image_patch_embedder", "time_caption_embed", "x_embedder", "norm1.linear", "norm_out"
@@ -164,284 +122,63 @@ BOOGU_LAYER_KEYNAMES = [
 IDEOGRAM4_LAYER_KEYNAMES = ["embed_image_indicator", "t_embedding", "llm_cond_proj", "adaln_proj", "final_layer", "input_proj"]
 
 # --- Model Filter Registry ---
-# Each entry maps a CLI flag (--radiance, --flux2, etc.) to its layer patterns.
-# Keys:
-#   "help"     - Help text for CLI
-#   "category" - For grouping in --help-filters (text, diffusion, video, image)
-#   "exclude"  - Layers to skip quantization entirely (extends AVOID_KEY_NAMES)
-#   "highprec" - Layers to keep in high precision (not quantized)
-#   "remove"   - Layers to remove from output entirely (rare, e.g., T5XXL decoder)
-
 MODEL_FILTERS = {
-    # Text Encoders
-    "gemma4": {
-        "help":
-        "Gemma 4 text/multimodal model: protect embeddings, K/V projections, audio, vision, and multimodal projectors",
-        "category": "text",
-        "exclude": GEMMA4_AVOID_KEY_NAMES
-    },
-    "qwen35": {
-        "help": "Qwen3.5 text/multimodal model: protect boundary layers, embeddings, and all visual components",
-        "category": "text",
-        "exclude": QWEN35_AVOID_KEY_NAMES
-    },
-    "t5xxl": {
-        "help": "T5-XXL text encoder: skip norms/biases, remove decoder layers",
-        "category": "text",
-        "exclude": AVOID_KEY_NAMES,
-        "remove": T5XXL_REMOVE_KEY_NAMES
-    },
-    "mistral": {
-        "help": "Mistral text encoder exclusions",
-        "category": "text",
-        "exclude": AVOID_KEY_NAMES
-    },
-    "visual": {
-        "help": "Visual encoder: protect MLP projections, patch/position embeddings, and merger layers",
-        "category": "text",
-        "exclude": VISUAL_AVOID_KEY_NAMES
-    },
-    "generic_text": {
-        "help": "Generic text encoder: emit input scales for supported FP8 runtimes (does not exclude layers)",
-        "category": "text"
-    },
-    # Diffusion Models (Flux-style)
-    "flux1": {
-        "help": "Flux.1: keep modulation/guidance/time/final/input layers high-precision",
-        "category": "diffusion",
-        "highprec": FLUX1_LAYER_KEYNAMES
-    },
-    "anima": {
-        "help": "Anima diffusion model: keep first blocks, adaln_modulation, final/embedding layers high-precision",
-        "category": "diffusion",
-        "highprec": ANIMA_LAYER_KEYNAMES
-    },
-    "lens": {
-        "help": "LENS diffusion model: keep time_text_embed, img_in, norm_out, proj_out, some mod layers high-precision",
-        "category": "diffusion",
-        "highprec": LENS_LAYER_KEYNAMES
-    },
-    "flux2": {
-        "help": "Flux.2: keep modulation/guidance/time/final layers high-precision",
-        "category": "diffusion",
-        "highprec": FLUX2_LAYER_KEYNAMES
-    },
-    "flux_klein": {
-        "help": "FLUX.2 Klein: keep modulation/time/final/input layers high-precision",
-        "category": "diffusion",
-        "highprec": FLUX_KLEIN_LAYER_KEYNAMES
-    },
-    "distillation_large": {
-        "help": "Chroma/distilled (large): keep distilled_guidance, final, img/txt_in high-precision",
-        "category": "diffusion",
-        "highprec": DISTILL_LAYER_KEYNAMES_LARGE
-    },
-    "distillation_small": {
-        "help": "Chroma/distilled (small): keep only distilled_guidance high-precision",
-        "category": "diffusion",
-        "highprec": DISTILL_LAYER_KEYNAMES_SMALL
-    },
-    "nerf_large": {
-        "help": "NeRF (large): keep nerf_blocks, distilled_guidance, txt_in high-precision",
-        "category": "diffusion",
-        "highprec": NERF_LAYER_KEYNAMES_LARGE
-    },
-    "nerf_small": {
-        "help": "NeRF (small): keep nerf_blocks, distilled_guidance high-precision",
-        "category": "diffusion",
-        "highprec": NERF_LAYER_KEYNAMES_SMALL
-    },
-    "radiance": {
-        "help": "Radiance model: keep img_in_patch, nerf_final_layer high-precision",
-        "category": "diffusion",
-        "highprec": RADIANCE_LAYER_KEYNAMES
-    },
-    "krea2": {
-        "help": "Krea2: keep firs, las, tml, txtfusion, last.modulation, tpro layers high-precision",
-        "category": "diffusion",
-        "highprec": KREA2_LAYER_KEYNAMES
-    },
-    "ideogram4": {
-        "help": "Ideogram4: keep embed_image_indicator, t_embedding, adaln_proj, final_layer, input_proj layers high-precision",
-        "category": "diffusion",
-        "highprec": IDEOGRAM4_LAYER_KEYNAMES
-    },
-    # Video Models
-    "wan": {
-        "help": "WAN video model: skip embeddings, encoders, head",
-        "category": "video",
-        "exclude": AVOID_KEY_NAMES,
-        "highprec": WAN_LAYER_KEYNAMES
-    },
-    "hunyuan": {
-        "help": "Hunyuan Video 1.5: skip layernorm, attn norms, vision_in",
-        "category": "video",
-        "exclude": HUNYUAN_AVOID_KEY_NAMES
-    },
-    # Image Models
-    "qwen": {
-        "help": "Qwen Image: skip added norms, keep time_text_embed high-precision",
-        "category": "image",
-        "exclude": QWEN_AVOID_KEY_NAMES,
-        "highprec": QWEN_LAYER_KEYNAMES
-    },
-    "ernie_image": {
-        "help": "ERNIE Image: keep author-recommended time, AdaLN, boundary, and projection layers high-precision",
-        "category": "image",
-        "highprec": ERNIE_IMAGE_LAYER_KEYNAMES
-    },
-    "zimage": {
-        "help": "Z-Image: skip cap_embedder/norms, keep x_embedder/final high-precision",
-        "category": "image",
-        "exclude": ZIMAGE_AVOID_KEY_NAMES,
-        "highprec": ZIMAGE_LAYER_KEYNAMES
-    },
-    "zimage_refiner": {
-        "help": "Z-Image Refiner: keep context/noise refiner high-precision",
-        "category": "image",
-        "exclude": ZIMAGE_AVOID_KEY_NAMES,
-        "highprec": ZIMAGE_REFINER_LAYER_KEYNAMES
-    },
-    "boogu": {
-        "help": "Boogu: keep image_index_embedding, ref_image_patch_embedder, time_caption_embed, x_embedder high-precision",
-        "category": "image",
-        "highprec": BOOGU_LAYER_KEYNAMES
-    },
-    "ltxv2": {
-        "help": "LTXv2: keep some transformer blocks high-precision and exclude vae and vocoder",
-        "category": "video",
-        "highprec": LTXV2_LAYER_KEYNAMES
-    },
-    "ltx2": {
-        "help": "LTX v2 / v2.3: keep boundary blocks, audio/video connectors, VAE, and vocoder high-precision",
-        "category": "video",
-        "highprec": LTXV2_LAYER_KEYNAMES
-    },
-    "ltx2_3": {
-        "help": "LTX v2.3: keep boundary blocks, audio/video connectors, VAE, and vocoder high-precision",
-        "category": "video",
-        "highprec": LTXV2_LAYER_KEYNAMES
-    },
+    "gemma4": {"help": "Gemma 4 text/multimodal model", "category": "text", "exclude": GEMMA4_AVOID_KEY_NAMES},
+    "qwen35": {"help": "Qwen3.5 text/multimodal model", "category": "text", "exclude": QWEN35_AVOID_KEY_NAMES},
+    "t5xxl": {"help": "T5-XXL text encoder", "category": "text", "exclude": AVOID_KEY_NAMES, "remove": T5XXL_REMOVE_KEY_NAMES},
+    "mistral": {"help": "Mistral text encoder", "category": "text", "exclude": AVOID_KEY_NAMES},
+    "visual": {"help": "Visual encoder", "category": "text", "exclude": VISUAL_AVOID_KEY_NAMES},
+    "generic_text": {"help": "Generic text encoder", "category": "text"},
+    "flux1": {"help": "Flux.1 model", "category": "diffusion", "highprec": FLUX1_LAYER_KEYNAMES},
+    "anima": {"help": "Anima model", "category": "diffusion", "highprec": ANIMA_LAYER_KEYNAMES},
+    "lens": {"help": "LENS model", "category": "diffusion", "highprec": LENS_LAYER_KEYNAMES},
+    "flux2": {"help": "Flux.2 model", "category": "diffusion", "highprec": FLUX2_LAYER_KEYNAMES},
+    "flux_klein": {"help": "FLUX.2 Klein model", "category": "diffusion", "highprec": FLUX_KLEIN_LAYER_KEYNAMES},
+    "distillation_large": {"help": "Distilled (large) model", "category": "diffusion", "highprec": DISTILL_LAYER_KEYNAMES_LARGE},
+    "distillation_small": {"help": "Distilled (small) model", "category": "diffusion", "highprec": DISTILL_LAYER_KEYNAMES_SMALL},
+    "nerf_large": {"help": "NeRF (large) model", "category": "diffusion", "highprec": NERF_LAYER_KEYNAMES_LARGE},
+    "nerf_small": {"help": "NeRF (small) model", "category": "diffusion", "highprec": NERF_LAYER_KEYNAMES_SMALL},
+    "radiance": {"help": "Radiance model", "category": "diffusion", "highprec": RADIANCE_LAYER_KEYNAMES},
+    "krea2": {"help": "Krea2 model", "category": "diffusion", "highprec": KREA2_LAYER_KEYNAMES},
+    "ideogram4": {"help": "Ideogram4 model", "category": "diffusion", "highprec": IDEOGRAM4_LAYER_KEYNAMES},
+    "wan": {"help": "WAN video model", "category": "video", "exclude": AVOID_KEY_NAMES, "highprec": WAN_LAYER_KEYNAMES},
+    "hunyuan": {"help": "Hunyuan Video model", "category": "video", "exclude": HUNYUAN_AVOID_KEY_NAMES},
+    "qwen": {"help": "Qwen Image model", "category": "image", "exclude": QWEN_AVOID_KEY_NAMES, "highprec": QWEN_LAYER_KEYNAMES},
+    "ernie_image": {"help": "ERNIE Image model", "category": "image", "highprec": ERNIE_IMAGE_LAYER_KEYNAMES},
+    "zimage": {"help": "Z-Image model", "category": "image", "exclude": ZIMAGE_AVOID_KEY_NAMES, "highprec": ZIMAGE_LAYER_KEYNAMES},
+    "zimage_refiner": {"help": "Z-Image Refiner model", "category": "image", "exclude": ZIMAGE_AVOID_KEY_NAMES, "highprec": ZIMAGE_REFINER_LAYER_KEYNAMES},
+    "boogu": {"help": "Boogu model", "category": "image", "highprec": BOOGU_LAYER_KEYNAMES},
+    "ltxv2": {"help": "LTXv2 model", "category": "video", "highprec": LTXV2_LAYER_KEYNAMES},
+    "ltx2": {"help": "LTX v2 model", "category": "video", "highprec": LTXV2_LAYER_KEYNAMES},
+    "ltx2_3": {"help": "LTX v2.3 model", "category": "video", "highprec": LTXV2_LAYER_KEYNAMES},
 }
 
 
 def build_exclusion_patterns(active_filters: dict) -> tuple:
-    """
-    Build layer skip/remove patterns from active filter flags.
-
-    "exclude" and "highprec" keys in MODEL_FILTERS are functionally identical:
-    both mean "do not quantize this layer". Only "remove" is distinct (layer
-    deleted from output entirely, used only by t5xxl).
-
-    Args:
-        active_filters: Dict of filter_name -> bool (e.g., {"radiance": True, "t5xxl": False})
-
-    Returns:
-        Tuple of (skip_patterns, skip_patterns, remove_patterns)
-        First two elements are identical (combined exclude+highprec) for backwards compat.
-    """
     skip = []
     remove = []
-
     for name, cfg in MODEL_FILTERS.items():
         if active_filters.get(name, False):
             skip.extend(cfg.get("exclude", []))
             skip.extend(cfg.get("highprec", []))
             remove.extend(cfg.get("remove", []))
-
     return skip, skip, remove
 
 
 # --- Dtype settings ---
-TARGET_FP8_DTYPE = torch.float8_e4m3fn
-TARGET_INT8_DTYPE = torch.int8
 COMPUTE_DTYPE = torch.float32
 SCALE_DTYPE = torch.float32
-
-# FP8 constants
-FP8_MIN = float(torch.finfo(TARGET_FP8_DTYPE).min)
-FP8_MAX = float(torch.finfo(TARGET_FP8_DTYPE).max)
-FP8_MIN_POS = float(torch.finfo(TARGET_FP8_DTYPE).tiny)
-
-# INT8 constants (using symmetric range [-127, 127] for symmetric quantization)
-INT8_MIN = int(torch.iinfo(TARGET_INT8_DTYPE).min)  # -128
-INT8_MAX = int(torch.iinfo(TARGET_INT8_DTYPE).max)  # 127
-INT8_SYMMETRIC_MAX = min(abs(INT8_MIN), INT8_MAX)  # 127 (symmetric range)
 
 # INT4 / ConvRot W4A4 constants
 INT4_MIN = -7
 INT4_MAX = 7
 INT4_GROUP_SIZE = 64
-TARGET_INT4_DTYPE = torch.int8  # Storage format (packed 2 values per byte)
+TARGET_INT4_DTYPE = torch.int8
 
-# FP4 NVFP4 E2M1 constants
-TARGET_FP4_DTYPE = torch.uint8  # Packed format (2 values per byte)
-FP4_E2M1_MAX = 6.0
-FP4_E2M1_EPS = 0.5
-FP4_BLOCK_SIZE = 16  # NVFP4 uses 16-element blocks
-
-# MXFP8 (Microscaling FP8) constants
-# MXFP8 uses FP8 E4M3 data with E8M0 (power-of-2 exponent) block scales
-MXFP8_BLOCK_SIZE = 32  # MXFP8 uses 32-element blocks
-MXFP8_DTYPE = torch.float8_e4m3fn  # Data stored as FP8 E4M3
-E8M0_BIAS = 127  # Exponent bias for E8M0 format (value = 2^(exp - 127))
-
-# W4A8 INT8 constants (AsymW4A8Int8Layout)
-W4A8_GROUP_SIZE = 16
-W4A8_CONVROT_GROUPSIZE = 256
-W4A8_SCALE_DTYPE = torch.float8_e4m3fn
-
-# --- Adaptive LR Tier Configuration ---
-# Used by 'original' optimizer in LearnedRoundingConverter and LearnedNVFP4Converter.
-# Format: List of (counter_threshold, improvement_mult, decay_mult, min_lr)
-#   - counter_threshold: worse_loss_counter must be >= this to use this tier
-#   - improvement_mult: LR multiplier when loss improves (boost)
-#   - decay_mult: LR multiplier when loss worsens (decay)
-#   - min_lr: minimum LR floor for decay operations at this tier
-ADAPTIVE_LR_TIERS_IMPROVE = [
-    # (counter_threshold, multiplier, max_lr)
-    (0, 1.25, 100.0),  # counter < 50: boost by 1.25x
-    (50, 1.375, 100.0),  # 50 <= counter < 75
-    (75, 1.5, 100.0),  # 75 <= counter < 100
-    (100, 1.75, 100.0),  # 100 <= counter < 125
-    (125, 2.0, 100.0),  # 125 <= counter < 150
-    (150, 2.25, 100.0),  # 150 <= counter < 200
-    (200, 2.5, 100.0),  # 200 <= counter < 250
-    (250, 2.75, 100.0),  # 250 <= counter < 300
-    (300, 3.0, 100.0),  # counter >= 300
-]
-
-ADAPTIVE_LR_TIERS_DECAY = [
-    # (counter_threshold, multiplier, min_lr)
-    (0, 0.95, 9e-8),  # counter < 26: decay by 0.95x
-    (26, 0.97, 8e-8),  # 26 <= counter < 51
-    (51, 0.985, 7e-8),  # 51 <= counter < 76
-    (76, 0.9875, 6e-8),  # 76 <= counter < 101
-    (101, 0.98875, 5e-8),  # 101 <= counter < 151
-    (151, 0.99, 4e-8),  # 151 <= counter < 201
-    (201, 0.99125, 3e-8),  # 201 <= counter < 251
-    (251, 0.9925, 2e-8),  # 251 <= counter < 301
-    (301, 0.995, 5e-9),  # counter >= 301
-]
-
-# Valid quantization formats (maps to QUANT_ALGOS in quant_ops.py)
+# Valid quantization formats
 VALID_QUANT_FORMATS = {
-    "float8_e4m3fn",
-    "float8_e4m3fn_rowwise",
-    "float8_e4m3fn_blockwise",
-    "float8_e4m3fn_block3d",
-    "int8_blockwise",
-    "int8_tensorwise",
-    "convrot_w4a4",  # INT4 W4A4 with ConvRot Hadamard rotation
-    "nvfp4",  # NVIDIA FP4 E2M1 block quantization
-    "mxfp8",  # Microscaling FP8 block quantization
-    "hybrid_mxfp8",  # Hybrid MXFP8 (MXFP8 + tensorwise fallback)
-    "w4a8_int8",  # Grouped W4A8 INT8 (AsymW4A8Int8Layout)
-    "asym_w4a8_int8",  # Standard ComfyUI format key for AsymW4A8Int8Layout
-    "w4a8",
+    "convrot_w4a4",
+    "int4",
 }
 
-# Global config: normalize 1-element scale arrays to scalars (set from CLI)
 NORMALIZE_SCALES_ENABLED = True
-
-

@@ -10,36 +10,11 @@ from . import (
 _LAYOUT_REGISTRY = {}
 _GENERIC_UTILS = {}
 
-# Try to import Triton-based INT8 kernels
-try:
-    from .int8_kernels import act_dequant as triton_act_dequant
-    from .int8_kernels import act_quant as triton_act_quant
-    from .int8_kernels import int8_addmm as triton_int8_addmm
-    from .int8_kernels import int8_addmm_quant as triton_int8_addmm_quant
-    from .int8_kernels import int8_gemm as triton_int8_gemm
-    from .int8_kernels import int8_gemm_quant as triton_int8_gemm_quant
-    from .int8_kernels import weight_dequant as triton_weight_dequant
-    from .int8_kernels import weight_quant as triton_weight_quant
-
-    _HAS_TRITON_INT8 = True
-except ImportError:
-    _HAS_TRITON_INT8 = False
-    logging.warning("Triton INT8 kernels not available, using PyTorch fallback")
-
 
 def register_layout_op(torch_op, layout_type):
     """
     Decorator to register a layout-specific operation handler.
-    Args:
-        torch_op: PyTorch operation (e.g., torch.ops.aten.linear.default)
-        layout_type: Layout class (e.g., TensorCoreFP8Layout)
-    Example:
-        @register_layout_op(torch.ops.aten.linear.default, TensorCoreFP8Layout)
-        def fp8_linear(func, args, kwargs):
-            # FP8-specific linear implementation
-            ...
     """
-
     def decorator(handler_func):
         if torch_op not in _LAYOUT_REGISTRY:
             _LAYOUT_REGISTRY[torch_op] = {}
@@ -52,16 +27,7 @@ def register_layout_op(torch_op, layout_type):
 def register_generic_util(torch_op):
     """
     Decorator to register a generic utility that works for all layouts.
-    Args:
-        torch_op: PyTorch operation (e.g., torch.ops.aten.detach.default)
-
-    Example:
-        @register_generic_util(torch.ops.aten.detach.default)
-        def generic_detach(func, args, kwargs):
-            # Works for any layout
-            ...
     """
-
     def decorator(handler_func):
         _GENERIC_UTILS[torch_op] = handler_func
         return handler_func
@@ -109,14 +75,7 @@ def _copy_layout_params_inplace(src, dst, non_blocking=False):
 
 
 class QuantizedLayout:
-    """
-    Base class for quantization layouts.
-
-    A layout encapsulates the format-specific logic for quantization/dequantization
-    and provides a uniform interface for extracting raw tensors needed for computation.
-
-    New quantization formats should subclass this and implement the required methods.
-    """
+    """Base class for quantization layouts."""
 
     @classmethod
     def quantize(cls, tensor, **kwargs) -> Tuple[torch.Tensor, Dict]:
@@ -133,30 +92,11 @@ class QuantizedLayout:
 
 class QuantizedTensor(torch.Tensor):
     """
-    Universal quantized tensor that works with any layout.
-
-    This tensor subclass uses a pluggable layout system to support multiple
-    quantization formats (FP8, INT4, INT8, etc.) without code duplication.
-
-    The layout_type determines format-specific behavior, while common operations
-    (detach, clone, to) are handled generically.
-
-    Attributes:
-        _qdata: The quantized tensor data
-        _layout_type: Layout class (e.g., TensorCoreFP8Layout)
-        _layout_params: Dict with layout-specific params (scale, zero_point, etc.)
+    Universal quantized tensor wrapper for INT4 ConvRot W4A4 layout.
     """
 
     @staticmethod
     def __new__(cls, qdata, layout_type, layout_params):
-        """
-        Create a quantized tensor.
-
-        Args:
-            qdata: The quantized data tensor
-            layout_type: Layout class (subclass of QuantizedLayout)
-            layout_params: Dict with layout-specific parameters
-        """
         return torch.Tensor._make_wrapper_subclass(cls, qdata.shape, device=qdata.device, dtype=qdata.dtype, requires_grad=False)
 
     def __init__(self, qdata, layout_type, layout_params):
@@ -165,18 +105,14 @@ class QuantizedTensor(torch.Tensor):
         self._layout_params = layout_params
 
     def __repr__(self):
-        layout_name = self._layout_type
         param_str = ", ".join(f"{k}={v}" for k, v in list(self._layout_params.items())[:2])
-        return f"QuantizedTensor(shape={self.shape}, layout={layout_name}, {param_str})"
+        return f"QuantizedTensor(shape={self.shape}, layout={self._layout_type}, {param_str})"
 
     @property
     def layout_type(self):
         return self._layout_type
 
     def __tensor_flatten__(self):
-        """
-        Tensor flattening protocol for proper device movement.
-        """
         inner_tensors = ["_qdata"]
         ctx = {"layout_type": self._layout_type}
 
@@ -200,10 +136,6 @@ class QuantizedTensor(torch.Tensor):
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride):
-        """
-        Tensor unflattening protocol for proper device movement.
-        Reconstructs the QuantizedTensor after device movement.
-        """
         layout_type = ctx["layout_type"]
         layout_params = dict(ctx["non_tensor_params"])
 
@@ -214,7 +146,7 @@ class QuantizedTensor(torch.Tensor):
         return QuantizedTensor(inner_tensors["_qdata"], layout_type, layout_params)
 
     @classmethod
-    def from_float(cls, tensor, layout_type, **quantize_kwargs) -> "QuantizedTensor":
+    def from_float(cls, tensor, layout_type="TensorCoreConvRotW4A4Layout", **quantize_kwargs) -> "QuantizedTensor":
         qdata, layout_params = LAYOUTS[layout_type].quantize(tensor, **quantize_kwargs)
         return cls(qdata, layout_type, layout_params)
 
@@ -225,28 +157,19 @@ class QuantizedTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
 
-        # Step 1: Check generic utilities first (detach, clone, to, etc.)
         if func in _GENERIC_UTILS:
             return _GENERIC_UTILS[func](func, args, kwargs)
 
-        # Step 2: Check layout-specific handlers (linear, matmul, etc.)
         layout_type = _get_layout_from_args(args)
         if layout_type and func in _LAYOUT_REGISTRY:
             handler = _LAYOUT_REGISTRY[func].get(layout_type)
             if handler:
                 return handler(func, args, kwargs)
 
-        # Step 3: Fallback to dequantization
-        # if isinstance(args[0] if args else None, QuantizedTensor):
-        # logging.info(f"QuantizedTensor: Unhandled operation {func}, falling back to dequantization. kwargs={kwargs}, args={args}")
-
-        to_return = cls._dequant_and_fallback(func, args, kwargs)
-
-        return to_return
+        return cls._dequant_and_fallback(func, args, kwargs)
 
     @classmethod
     def _dequant_and_fallback(cls, func, args, kwargs):
-
         def dequant_arg(arg):
             if isinstance(arg, QuantizedTensor):
                 return arg.dequantize()
@@ -275,7 +198,6 @@ class QuantizedTensor(torch.Tensor):
 # Generic Utilities (Layout-Agnostic Operations)
 # ==============================================================================
 
-
 def _create_transformed_qtensor(qt, transform_fn):
     new_data = transform_fn(qt._qdata)
     new_params = _copy_layout_params(qt._layout_params)
@@ -283,35 +205,25 @@ def _create_transformed_qtensor(qt, transform_fn):
 
 
 def _handle_device_transfer(qt, target_device, target_dtype=None, target_layout=None, op_name="to"):
-    if target_layout is not None and target_layout != torch.strided:
-        logging.warning(f"QuantizedTensor: layout change requested to {target_layout}, but not supported. Ignoring layout.")
-
-    # Handle device transfer
     current_device = qt._qdata.device
     if target_device is not None:
-        # Normalize device for comparison
         if isinstance(target_device, str):
             target_device = torch.device(target_device)
         if isinstance(current_device, str):
             current_device = torch.device(current_device)
 
         if target_device != current_device:
-            logging.debug(f"QuantizedTensor.{op_name}: Moving from {current_device} to {target_device}")
             new_q_data = qt._qdata.to(device=target_device)
             new_params = _move_layout_params_to_device(qt._layout_params, target_device)
             if target_dtype is not None:
                 new_params["orig_dtype"] = target_dtype
-            new_qt = QuantizedTensor(new_q_data, qt._layout_type, new_params)
-            logging.debug(f"QuantizedTensor.{op_name}: Created new tensor on {target_device}")
-            return new_qt
+            return QuantizedTensor(new_q_data, qt._layout_type, new_params)
 
-    logging.debug(f"QuantizedTensor.{op_name}: No device change needed, returning original")
     return qt
 
 
 @register_generic_util(torch.ops.aten.detach.default)
 def generic_detach(func, args, kwargs):
-    """Detach operation - creates a detached copy of the quantized tensor."""
     qt = args[0]
     if isinstance(qt, QuantizedTensor):
         return _create_transformed_qtensor(qt, lambda x: x.detach())
@@ -320,7 +232,6 @@ def generic_detach(func, args, kwargs):
 
 @register_generic_util(torch.ops.aten.clone.default)
 def generic_clone(func, args, kwargs):
-    """Clone operation - creates a deep copy of the quantized tensor."""
     qt = args[0]
     if isinstance(qt, QuantizedTensor):
         return _create_transformed_qtensor(qt, lambda x: x.clone())
@@ -329,7 +240,6 @@ def generic_clone(func, args, kwargs):
 
 @register_generic_util(torch.ops.aten._to_copy.default)
 def generic_to_copy(func, args, kwargs):
-    """Device/dtype transfer operation - handles .to(device) calls."""
     qt = args[0]
     if isinstance(qt, QuantizedTensor):
         return _handle_device_transfer(qt, target_device=kwargs.get("device", None), target_dtype=kwargs.get("dtype", None), op_name="_to_copy")
@@ -338,7 +248,6 @@ def generic_to_copy(func, args, kwargs):
 
 @register_generic_util(torch.ops.aten.to.dtype_layout)
 def generic_to_dtype_layout(func, args, kwargs):
-    """Handle .to(device) calls using the dtype_layout variant."""
     qt = args[0]
     if isinstance(qt, QuantizedTensor):
         return _handle_device_transfer(qt, target_device=kwargs.get("device", None), target_dtype=kwargs.get("dtype", None), target_layout=kwargs.get("layout", None), op_name="to")
@@ -347,10 +256,8 @@ def generic_to_dtype_layout(func, args, kwargs):
 
 @register_generic_util(torch.ops.aten.to.dtype)
 def generic_to_dtype(func, args, kwargs):
-    """Handle .to(dtype) calls - dtype conversion only."""
     src = args[0]
     if isinstance(src, QuantizedTensor):
-        # For dtype-only conversion, just change the orig_dtype, no real cast is needed
         target_dtype = args[1] if len(args) > 1 else kwargs.get("dtype")
         src._layout_params["orig_dtype"] = target_dtype
         return src
@@ -364,14 +271,13 @@ def generic_copy_(func, args, kwargs):
     non_blocking = args[2] if len(args) > 2 else False
     if isinstance(qt_dest, QuantizedTensor):
         if isinstance(src, QuantizedTensor):
-            # Copy from another quantized tensor
             qt_dest._qdata.copy_(src._qdata, non_blocking=non_blocking)
             qt_dest._layout_type = src._layout_type
-            orig_dtype = qt_dest._layout_params["orig_dtype"]
+            orig_dtype = qt_dest._layout_params.get("orig_dtype")
             _copy_layout_params_inplace(src._layout_params, qt_dest._layout_params, non_blocking=non_blocking)
-            qt_dest._layout_params["orig_dtype"] = orig_dtype
+            if orig_dtype is not None:
+                qt_dest._layout_params["orig_dtype"] = orig_dtype
         else:
-            # Copy from regular tensor - just copy raw data
             qt_dest._qdata.copy_(src)
         return qt_dest
     return func(*args, **kwargs)
@@ -384,1910 +290,145 @@ def generic_has_compatible_shallow_copy_type(func, args, kwargs):
 
 @register_generic_util(torch.ops.aten.empty_like.default)
 def generic_empty_like(func, args, kwargs):
-    """Empty_like operation - creates an empty tensor with the same quantized structure."""
     qt = args[0]
     if isinstance(qt, QuantizedTensor):
-        # Create empty tensor with same shape and dtype as the quantized data
-        hp_dtype = kwargs.pop("dtype", qt._layout_params["orig_dtype"])
+        hp_dtype = kwargs.pop("dtype", qt._layout_params.get("orig_dtype", torch.float32))
         new_qdata = torch.empty_like(qt._qdata, **kwargs)
-
-        # Handle device transfer for layout params
         target_device = kwargs.get("device", new_qdata.device)
         new_params = _move_layout_params_to_device(qt._layout_params, target_device)
-
-        # Update orig_dtype if dtype is specified
         new_params["orig_dtype"] = hp_dtype
-
         return QuantizedTensor(new_qdata, qt._layout_type, new_params)
     return func(*args, **kwargs)
 
 
 # ==============================================================================
-# FP8 Layout + Operation Handlers
+# INT4 ConvRot W4A4 Layout Definition
 # ==============================================================================
-class TensorCoreFP8Layout(QuantizedLayout):
-    """
-    Storage format:
-    - qdata: FP8 tensor (torch.float8_e4m3fn or torch.float8_e5m2)
-    - scale: Scalar tensor (float32) for dequantization
-    - orig_dtype: Original dtype before quantization (for casting back)
-    """
-
-    @classmethod
-    def quantize(cls, tensor, scale=None, dtype=torch.float8_e4m3fn, stochastic_rounding=0, inplace_ops=False):
-        orig_dtype = tensor.dtype
-
-        if isinstance(scale, str) and scale == "recalculate":
-            scale = torch.amax(tensor.abs()).to(dtype=torch.float32) / torch.finfo(dtype).max
-            if tensor.dtype not in [torch.float32, torch.bfloat16]:  # Prevent scale from being too small
-                tensor_info = torch.finfo(tensor.dtype)
-                scale = 1.0 / torch.clamp((1.0 / scale), min=tensor_info.min, max=tensor_info.max)
-
-        if scale is not None:
-            if not isinstance(scale, torch.Tensor):
-                scale = torch.tensor(scale)
-            scale = scale.to(device=tensor.device, dtype=torch.float32)
-
-            if inplace_ops:
-                tensor *= (1.0 / scale).to(tensor.dtype)
-            else:
-                tensor = tensor * (1.0 / scale).to(tensor.dtype)
-        else:
-            scale = torch.ones((), device=tensor.device, dtype=torch.float32)
-
-        if stochastic_rounding > 0:
-            tensor = comfy_float.stochastic_rounding(tensor, dtype=dtype, seed=stochastic_rounding)
-        else:
-            lp_amax = torch.finfo(dtype).max
-            torch.clamp(tensor, min=-lp_amax, max=lp_amax, out=tensor)
-            tensor = tensor.to(dtype, memory_format=torch.contiguous_format)
-
-        layout_params = {"scale": scale, "orig_dtype": orig_dtype}
-        return tensor, layout_params
-
-    @staticmethod
-    def dequantize(qdata, scale, orig_dtype, **kwargs):
-        plain_tensor = torch.ops.aten._to_copy.default(qdata, dtype=orig_dtype)
-        plain_tensor.mul_(scale)
-        return plain_tensor
-
-    @classmethod
-    def get_plain_tensors(cls, qtensor):
-        return qtensor._qdata, qtensor._layout_params["scale"]
-
-
-# ==============================================================================
-# Row-Wise FP8 Layout (One scale per row)
-# ==============================================================================
-class RowWiseFP8Layout(QuantizedLayout):
-    """
-    Row-wise FP8 quantization layout.
-
-    Storage format:
-    - qdata: FP8 tensor (torch.float8_e4m3fn)
-    - scale: Per-row scaling factors, shape (out_features,) - stored as dequant scale (reciprocal)
-    - orig_dtype: Original dtype before quantization
-
-    This layout provides a balance between tensor-wise scaling (1 scale) and
-    block-wise scaling, with one scale per output row.
-    """
-
-    @classmethod
-    def quantize(cls, tensor, scale=None, dtype=torch.float8_e4m3fn, **kwargs):
-        """
-        Quantize a 2D tensor with row-wise scaling.
-
-        Args:
-            tensor: Input tensor to quantize, shape (M, N)
-            scale: Optional pre-computed per-row scales (as dequant scales, i.e., reciprocal)
-            dtype: Target FP8 dtype
-
-        Returns:
-            Tuple of (quantized_data, layout_params)
-        """
-        orig_dtype = tensor.dtype
-
-        if tensor.ndim != 2:
-            raise ValueError(f"RowWiseFP8Layout requires 2D tensor, got shape {tensor.shape}")
-
-        M, N = tensor.shape
-        fp8_max = torch.finfo(dtype).max
-
-        if scale is None:
-            # Compute per-row absolute maximum
-            row_max = tensor.abs().amax(dim=1, keepdim=True)  # (M, 1)
-            quant_scale = fp8_max / row_max.clamp_min(1e-12)  # (M, 1)
-        else:
-            # scale is provided as dequant scale, convert to quant scale
-            quant_scale = (1.0 / scale).unsqueeze(1) if scale.ndim == 1 else (1.0 / scale)
-
-        # Apply scale per-row
-        tensor_scaled = tensor * quant_scale
-
-        # Clamp and convert
-        tensor_scaled = torch.clamp(tensor_scaled, -fp8_max, fp8_max)
-        qdata = tensor_scaled.to(dtype)
-
-        # Store dequant scale (reciprocal of quant scale)
-        dequant_scale = (1.0 / quant_scale).squeeze(1)  # (M,)
-
-        layout_params = {"scale": dequant_scale.to(torch.float32), "orig_dtype": orig_dtype}
-        return qdata, layout_params
-
-    @staticmethod
-    def dequantize(qdata, scale, orig_dtype, **kwargs):
-        """
-        Dequantize FP8 tensor with row-wise scaling.
-
-        Args:
-            qdata: Quantized FP8 tensor, shape (M, N)
-            scale: Per-row dequant scales, shape (M,)
-            orig_dtype: Target dtype for dequantization
-
-        Returns:
-            Dequantized tensor in orig_dtype
-        """
-        # scale shape: (M,), need to broadcast to (M, N)
-        scale_broadcast = scale.unsqueeze(1)  # (M, 1)
-        plain_tensor = qdata.to(orig_dtype) * scale_broadcast
-        return plain_tensor
-
-    @classmethod
-    def get_plain_tensors(cls, qtensor):
-        """Extract raw tensors for computation."""
-        return qtensor._qdata, qtensor._layout_params["scale"]
-
-
-# ==============================================================================
-# Block-Wise FP8 Layout (2D tile-based, similar to INT8)
-# ==============================================================================
-class BlockWiseFP8Layout(QuantizedLayout):
-    """
-    True 2D block-wise FP8 quantization layout (similar to BlockWiseINT8Layout).
-
-    Storage format:
-    - qdata: FP8 tensor (torch.float8_e4m3fn)
-    - scale: Per-block scaling factors, shape (M//block_size, N//block_size) - as dequant scale
-    - block_size: Size of quantization blocks
-    - orig_dtype: Original dtype before quantization
-
-    This layout divides the weight matrix into block_size x block_size tiles,
-    with one scale per tile. Optimized for inference with tile-based GEMM kernels.
-    """
-
-    @classmethod
-    def quantize(cls, tensor, scale=None, block_size=64, dtype=torch.float8_e4m3fn, **kwargs):
-        """
-        Quantize a 2D tensor with 2D block-wise scaling.
-
-        Args:
-            tensor: Input tensor to quantize, shape (M, N)
-            scale: Optional pre-computed per-block scales (as dequant scales)
-            block_size: Size of quantization blocks (both dimensions)
-            dtype: Target FP8 dtype
-
-        Returns:
-            Tuple of (quantized_data, layout_params)
-        """
-        orig_dtype = tensor.dtype
-
-        if tensor.ndim != 2:
-            raise ValueError(f"BlockWiseFP8Layout requires 2D tensor, got shape {tensor.shape}")
-
-        M, N = tensor.shape
-
-        if M % block_size != 0 or N % block_size != 0:
-            raise ValueError(f"BlockWiseFP8Layout requires dimensions divisible by block_size={block_size}. Got shape ({M}, {N})")
-
-        fp8_max = torch.finfo(dtype).max
-
-        # Reshape to 2D blocks: (M//bs, bs, N//bs, bs) -> (M//bs, N//bs, bs, bs)
-        tensor_blocked = tensor.reshape(M // block_size, block_size, N // block_size, block_size)
-        tensor_blocked = tensor_blocked.permute(0, 2, 1, 3)  # (M//bs, N//bs, bs, bs)
-
-        if scale is None:
-            # Compute per-block absolute maximum
-            block_max = tensor_blocked.abs().amax(dim=(2, 3))  # (M//bs, N//bs)
-            quant_scale = fp8_max / block_max.clamp_min(1e-12)
-        else:
-            # scale is provided as dequant scale, convert to quant scale
-            quant_scale = 1.0 / scale
-
-        # Apply scale per-block
-        scale_broadcast = quant_scale.unsqueeze(-1).unsqueeze(-1)  # (M//bs, N//bs, 1, 1)
-        tensor_scaled = tensor_blocked * scale_broadcast
-
-        # Clamp and convert
-        tensor_scaled = torch.clamp(tensor_scaled, -fp8_max, fp8_max)
-        qdata_blocked = tensor_scaled.to(dtype)
-
-        # Reshape back to original shape
-        qdata = qdata_blocked.permute(0, 2, 1, 3).reshape(M, N)
-
-        # Store dequant scale (reciprocal of quant scale)
-        dequant_scale = 1.0 / quant_scale  # (M//bs, N//bs)
-
-        layout_params = {"scale": dequant_scale.to(torch.float32), "block_size": block_size, "orig_dtype": orig_dtype}
-        return qdata, layout_params
-
-    @staticmethod
-    def dequantize(qdata, scale, block_size, orig_dtype, **kwargs):
-        """
-        Dequantize FP8 tensor with 2D block-wise scaling.
-
-        Args:
-            qdata: Quantized FP8 tensor, shape (M, N)
-            scale: Per-block dequant scales, shape (M//block_size, N//block_size)
-            block_size: Size of quantization blocks
-            orig_dtype: Target dtype for dequantization
-
-        Returns:
-            Dequantized tensor in orig_dtype
-        """
-        M, N = qdata.shape
-
-        # Reshape to blocks
-        qdata_blocked = qdata.reshape(M // block_size, block_size, N // block_size, block_size)
-        qdata_blocked = qdata_blocked.permute(0, 2, 1, 3)  # (M//bs, N//bs, bs, bs)
-
-        # Apply dequant scale per-block
-        scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1)  # (M//bs, N//bs, 1, 1)
-        dequantized = qdata_blocked.to(orig_dtype) * scale_broadcast
-
-        # Reshape back
-        dequantized = dequantized.permute(0, 2, 1, 3).reshape(M, N)
-        return dequantized
-
-    @classmethod
-    def get_plain_tensors(cls, qtensor):
-        """Extract raw tensors for computation."""
-        return (qtensor._qdata, qtensor._layout_params["scale"], qtensor._layout_params["block_size"])
-
-
-# ==============================================================================
-# Block-Wise INT8 Layout + Operation Handlers
-# ==============================================================================
-class BlockWiseINT8Layout(QuantizedLayout):
-    """
-    Block-wise INT8 quantization layout.
-
-    Storage format:
-    - qdata: INT8 tensor (torch.int8)
-    - scale: Per-block scaling factors (float32)
-    - block_size: Size of quantization blocks (default 128)
-    - orig_dtype: Original dtype before quantization (for casting back)
-    - is_weight: Whether this is a weight tensor (affects blocking dimension)
-
-    Asymmetric blocking:
-    - Weights: blocks partition along first dimension (M) and second dimension (N)
-              scale shape: (M//block_size, N//block_size)
-    - Activations: blocks partition along last dimension (K)
-                  scale shape: (*batch_dims, K//block_size)
-    """
-
-    @classmethod
-    def quantize(cls, tensor, scale=None, block_size=128, is_weight=False, **kwargs):
-        """
-        Quantize a tensor to INT8 with block-wise scaling.
-
-        Args:
-            tensor: Input tensor to quantize
-            scale: Optional pre-computed scaling factors
-            block_size: Size of quantization blocks (default 128)
-            is_weight: If True, block along both dimensions (for weights)
-                      If False, block along last dimension only (for activations)
-
-        Returns:
-            Tuple of (quantized_data, layout_params)
-        """
-        orig_dtype = tensor.dtype
-
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-
-        if is_weight:
-            # Weight quantization: block-wise along both M and N dimensions
-            # Expected shape: (M, N)
-            assert tensor.dim() == 2, f"Weight tensor must be 2D, got shape {tensor.shape}"
-            M, N = tensor.shape
-            assert M % block_size == 0 and N % block_size == 0, f"Dimensions must be divisible by block_size={block_size}, got shape {tensor.shape}"
-
-            # Use Triton kernel if available AND tensor is on CUDA
-            if _HAS_TRITON_INT8 and scale is None and tensor.is_cuda:
-                try:
-                    qdata, scale = triton_weight_quant(tensor, block_size=block_size)
-                except Exception as e:
-                    # don't fall back, raise, for easier debugging
-                    logging.warning(f"Triton weight_quant failed: {e}, falling back to PyTorch")
-                    raise e
-                    # qdata, scale = cls._weight_quantize_pytorch(tensor, block_size)
-            else:
-                qdata, scale = cls._weight_quantize_pytorch(tensor, block_size, scale)
-
-        else:
-            # Activation quantization: block-wise along last dimension (K)
-            # Can handle any shape: (*batch_dims, K)
-            K = tensor.shape[-1]
-            assert K % block_size == 0, f"Last dimension must be divisible by block_size={block_size}, got {K}"
-
-            # Use Triton kernel if available AND tensor is on CUDA
-            # ignore input scale for now
-            # TODO: why do we need input scale?
-            if _HAS_TRITON_INT8 and tensor.is_cuda:
-                try:
-                    qdata, scale = triton_act_quant(tensor, block_size=block_size)
-                except Exception as e:
-                    logging.warning(f"Triton act_quant failed: {e}, falling back to PyTorch")
-                    qdata, scale = cls._activation_quantize_pytorch(tensor, block_size)
-            else:
-                qdata, scale = cls._activation_quantize_pytorch(tensor, block_size, scale)
-
-        layout_params = {"scale": scale.to(torch.float32), "block_size": block_size, "is_weight": is_weight, "orig_dtype": orig_dtype}
-
-        return qdata, layout_params
-
-    @staticmethod
-    def _weight_quantize_pytorch(tensor, block_size, scale=None):
-        """PyTorch fallback for weight quantization"""
-        M, N = tensor.shape
-        # Reshape to (M//block_size, block_size, N//block_size, block_size)
-        tensor_blocked = tensor.reshape(M // block_size, block_size, N // block_size, block_size)
-        # Permute to (M//block_size, N//block_size, block_size, block_size)
-        tensor_blocked = tensor_blocked.permute(0, 2, 1, 3)
-
-        if scale is None:
-            # Compute per-block absolute maximum
-            amax = tensor_blocked.abs().amax(dim=(-2, -1))
-            scale = amax / 127.0
-            scale = torch.maximum(scale, torch.tensor(1e-8, device=scale.device, dtype=scale.dtype))
-
-        # Broadcast scale for division: (M//block_size, N//block_size, 1, 1)
-        scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1)
-        tensor_scaled = tensor_blocked / scale_broadcast
-
-        # Clamp and convert to int8
-        tensor_scaled = torch.clamp(tensor_scaled, -127.0, 127.0)
-        qdata = tensor_scaled.round().to(torch.int8)
-
-        # Reshape back to original shape
-        qdata = qdata.permute(0, 2, 1, 3).reshape(M, N)
-        return qdata, scale
-
-    @staticmethod
-    def _activation_quantize_pytorch(tensor, block_size, scale=None):
-        """PyTorch fallback for activation quantization"""
-        K = tensor.shape[-1]
-        batch_shape = tensor.shape[:-1]
-        tensor_blocked = tensor.reshape(*batch_shape, K // block_size, block_size)
-
-        if scale is None:
-            # Compute per-block absolute maximum
-            amax = tensor_blocked.abs().amax(dim=-1)
-            scale = amax / 127.0
-            scale = torch.maximum(scale, torch.tensor(1e-8, device=scale.device, dtype=scale.dtype))
-
-        # Broadcast scale for division
-        scale_broadcast = scale.unsqueeze(-1)
-        tensor_scaled = tensor_blocked / scale_broadcast
-
-        # Clamp and convert to int8
-        tensor_scaled = torch.clamp(tensor_scaled, -127.0, 127.0)
-        qdata = tensor_scaled.round().to(torch.int8)
-
-        # Reshape back to original shape
-        qdata = qdata.reshape(tensor.shape)
-        return qdata, scale
-
-    @staticmethod
-    def dequantize(qdata, scale, block_size, is_weight=False, orig_dtype=None, output_dtype=None, **kwargs):
-        """
-        Dequantize INT8 tensor back to original precision.
-
-        Args:
-            qdata: Quantized INT8 tensor
-            scale: Per-block scaling factors
-            block_size: Size of quantization blocks
-            is_weight: Whether this is a weight tensor
-            orig_dtype: Target dtype for dequantization
-
-        Returns:
-            Dequantized tensor in orig_dtype
-        """
-        if not qdata.is_contiguous():
-            qdata = qdata.contiguous()
-        if not scale.is_contiguous():
-            scale = scale.contiguous()
-
-        if is_weight:
-            # Weight dequantization
-            if _HAS_TRITON_INT8 and qdata.dim() == 2 and qdata.is_cuda:
-                try:
-                    dequant = triton_weight_dequant(qdata, scale, block_size=block_size, output_dtype=output_dtype if output_dtype is not None else orig_dtype)
-                    return dequant
-                except Exception as e:
-                    logging.warning(f"Triton weight_dequant failed: {e}, falling back to PyTorch")
-                    raise e
-
-            # PyTorch fallback
-            M, N = qdata.shape
-            # Ensure scale has the correct shape for weight dequantization
-            expected_scale_shape = (M // block_size, N // block_size)
-            if scale.shape != expected_scale_shape:
-                expected_numel = (M // block_size) * (N // block_size)
-                if scale.numel() == expected_numel:
-                    scale = scale.reshape(expected_scale_shape)
-                else:
-                    raise RuntimeError(f"Weight dequant scale shape mismatch: scale.shape={scale.shape}, expected {expected_scale_shape}")
-            qdata_blocked = qdata.reshape(M // block_size, block_size, N // block_size, block_size)
-            qdata_blocked = qdata_blocked.permute(0, 2, 1, 3)
-            scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1)
-            dequant = qdata_blocked.to(orig_dtype) * scale_broadcast
-            dequant = dequant.permute(0, 2, 1, 3).reshape(M, N)
-        else:
-            # Activation dequantization
-            if _HAS_TRITON_INT8 and qdata.is_cuda:
-                try:
-                    dequant = triton_act_dequant(qdata, scale, block_size=block_size, output_dtype=output_dtype if output_dtype is not None else orig_dtype)
-                    return dequant
-                except Exception as e:
-                    logging.warning(f"Triton act_dequant failed: {e}, falling back to PyTorch")
-                    raise e
-
-            # PyTorch fallback
-            batch_shape = qdata.shape[:-1]
-            K = qdata.shape[-1]
-            # Ensure scale has the correct shape for activation dequantization
-            expected_scale_shape = (*batch_shape, K // block_size)
-            if scale.shape != expected_scale_shape:
-                expected_numel = 1
-                for dim in expected_scale_shape:
-                    expected_numel *= dim
-                if scale.numel() == expected_numel:
-                    scale = scale.reshape(expected_scale_shape)
-                else:
-                    raise RuntimeError(f"Activation dequant scale shape mismatch: scale.shape={scale.shape}, expected {expected_scale_shape}")
-            qdata_blocked = qdata.reshape(*batch_shape, K // block_size, block_size)
-            scale_broadcast = scale.unsqueeze(-1)
-            dequant = qdata_blocked.to(orig_dtype) * scale_broadcast
-            dequant = dequant.reshape(qdata.shape)
-
-        return dequant
-
-    @classmethod
-    def get_plain_tensors(cls, qtensor):
-        """
-        Extract raw tensors for computation.
-
-        Returns:
-            Tuple of (qdata, scale, block_size, is_weight)
-        """
-        return (qtensor._qdata, qtensor._layout_params["scale"], qtensor._layout_params["block_size"], qtensor._layout_params["is_weight"])
-
-
-# ==============================================================================
-# Tensor-Wise INT8 Layout + Operation Handlers
-# ==============================================================================
-class TensorWiseINT8Layout(QuantizedLayout):
-    """
-    Tensor-wise and Row-wise INT8 quantization layout.
-    In the target ecosystem, int8_tensorwise handles both scalar and per-row scales.
-
-    Storage format:
-    - qdata: INT8 tensor (torch.int8)
-    - scale: Global scaling factor (scalar float32) OR per-row scaling factor (shape: [M] or [M, 1])
-    - is_weight: Boolean indicating if this is a weight tensor (required for per-row)
-    - orig_dtype: Original dtype before quantization
-    """
-
-    @classmethod
-    def quantize(cls, tensor, scale=None, is_weight=False, **kwargs):
-        """
-        Quantize a tensor to INT8 with tensor-wise or row-wise scaling.
-
-        Args:
-            tensor: Input tensor to quantize
-            scale: Optional pre-computed scaling factor (as dequant scale)
-            is_weight: Whether this is a weight tensor
-
-        Returns:
-            Tuple of (quantized_data, layout_params)
-        """
-        orig_dtype = tensor.dtype
-
-        if scale is not None:
-            # scale is provided as dequant scale, convert to quant scale
-            # Handle both scalar and row-wise scales
-            quant_scale = 1.0 / scale
-            tensor_scaled = tensor * quant_scale
-            tensor_scaled = torch.clamp(tensor_scaled, -127.0, 127.0)
-            qdata = tensor_scaled.round().to(torch.int8)
-            dequant_scale = scale
-        else:
-            # Auto-quantization
-            if is_weight:
-                # Per-row weight quantization (matches target ecosystem behavior for int8_tensorwise with per-row)
-                M, K = tensor.shape
-                row_max = tensor.abs().amax(dim=1, keepdim=True)
-                quant_scale = 127.0 / row_max.clamp_min(1e-12)
-                tensor_scaled = tensor * quant_scale
-                tensor_scaled = torch.clamp(tensor_scaled, -127.0, 127.0)
-                qdata = tensor_scaled.round().to(torch.int8)
-                dequant_scale = 1.0 / quant_scale
-            else:
-                # Dynamic activation quantization
-                from .int8_kernels import act_quant_rowwise
-
-                qdata, dequant_scale = act_quant_rowwise(tensor)
-
-        layout_params = {"scale": dequant_scale.to(torch.float32), "orig_dtype": orig_dtype, "is_weight": is_weight}
-
-        return qdata, layout_params
-
-    @staticmethod
-    def dequantize(qdata, scale, is_weight=False, orig_dtype=None, **kwargs):
-        """
-        Dequantize INT8 tensor back to original precision.
-
-        Args:
-            qdata: Quantized INT8 tensor
-            scale: Global or row-wise scaling factor
-            is_weight: Whether this is a weight tensor
-            orig_dtype: Target dtype for dequantization
-
-        Returns:
-            Dequantized tensor in orig_dtype
-        """
-        if orig_dtype is None:
-            orig_dtype = torch.float16
-
-        # Handle row-wise scale broadcasting
-        if scale.dim() > 0:
-            M = qdata.shape[0]
-            if scale.dim() == 1:
-                scale = scale.view(M, -1)
-            elif scale.dim() > 2:
-                scale = scale.view(M, -1)
-
-        return qdata.to(orig_dtype) * scale
-
-    @classmethod
-    def get_plain_tensors(cls, qtensor):
-        """Extract raw tensors for computation."""
-        return qtensor._qdata, qtensor._layout_params["scale"], qtensor._layout_params.get("is_weight", False)
-
-
 class TensorCoreConvRotW4A4Layout(QuantizedLayout):
     """
     ConvRot W4A4 Quantization Layout (group-wise Hadamard rotation + INT4).
 
     Storage format:
-    - qdata: INT8 tensor containing packed signed INT4 nibbles [N, K // 2]
-    - scale: Per-row scaling factor (shape: [N] or [N, 1])
-    - convrot_groupsize: Group size for regular Hadamard rotation (default 256)
-    - quant_group_size: Quantization group size (default 64)
+    - qdata: Packed int8 tensor (2 x 4-bit signed values [-7, 7] per byte)
+    - scale: Weight scale tensor (float32, 1 per row)
+    - convrot_groupsize: Group size for Hadamard rotation (default 256)
+    - quant_group_size: INT4 quantization group size (default 64)
     """
 
     @classmethod
     def quantize(cls, tensor, scale=None, convrot_groupsize=256, quant_group_size=64, **kwargs):
         from .int4_kernels import quantize_convrot_w4a4_weight
-        orig_dtype = tensor.dtype
+
         qdata, scales = quantize_convrot_w4a4_weight(tensor, convrot_groupsize=convrot_groupsize, quant_group_size=quant_group_size)
-        if scale is not None:
-            scales = scale
+
         layout_params = {
             "scale": scales.to(torch.float32),
-            "orig_dtype": orig_dtype,
             "convrot_groupsize": convrot_groupsize,
             "quant_group_size": quant_group_size,
+            "orig_dtype": tensor.dtype,
         }
         return qdata, layout_params
 
     @staticmethod
     def dequantize(qdata, scale, orig_dtype=None, convrot_groupsize=256, quant_group_size=64, **kwargs):
         from .int4_kernels import dequantize_convrot_w4a4_weight
-        if orig_dtype is None:
-            orig_dtype = torch.float16
+
+        out_dtype = orig_dtype if orig_dtype is not None else torch.float32
         return dequantize_convrot_w4a4_weight(
             qdata,
             scale,
             convrot_groupsize=convrot_groupsize,
             quant_group_size=quant_group_size,
-            output_dtype=orig_dtype,
+            output_dtype=out_dtype,
         )
 
     @classmethod
     def get_plain_tensors(cls, qtensor):
-        """Extract raw tensors for computation."""
         return qtensor._qdata, qtensor._layout_params["scale"]
 
 
-class AsymW4A8Int8Layout(QuantizedLayout):
-    """
-    AsymW4A8Int8Layout: Grouped W4A8 INT8 quantization layout with ConvRot Hadamard rotation.
-
-    Storage format:
-    - qdata: INT8 packed 4-bit tensor [N, K // 2]
-    - s_rel (scale): Per-group relative scale [N, K // group_size]
-    - s_channel: Per-channel scale [N]
-    - correction: Optional zero-point correction [groups, N]
-    - codebook: Optional 16-entry Lloyd-Max codebook [16]
-    """
-
-    @classmethod
-    def quantize(
-        cls,
-        tensor: torch.Tensor,
-        group_size: int = 16,
-        convrot_groupsize: int = 256,
-        symmetric: bool = True,
-        scale_dtype: torch.dtype = torch.float8_e4m3fn,
-        codebook: bool = True,
-        codebook_tensor: torch.Tensor | None = None,
-        stochastic_rounding: int = 0,
-        **kwargs,
-    ):
-        try:
-            from comfy_kitchen.tensor.w4a8_int8 import quantize_w4a8_int8_weight
-            qdata, s_rel, s_channel, correction, codebook_out = quantize_w4a8_int8_weight(
-                tensor,
-                group_size=group_size,
-                convrot_groupsize=convrot_groupsize,
-                symmetric=symmetric,
-                scale_dtype=scale_dtype,
-                codebook=codebook,
-                codebook_tensor=codebook_tensor,
-                stochastic_rounding=stochastic_rounding,
-            )
-        except Exception:
-            from ..converters.w4a8_int8_converter import quantize_w4a8_int8_pytorch
-            qdata, s_rel, s_channel, correction, codebook_out = quantize_w4a8_int8_pytorch(
-                tensor,
-                group_size=group_size,
-                convrot_groupsize=convrot_groupsize,
-                symmetric=symmetric,
-                scale_dtype=scale_dtype,
-                codebook=codebook,
-            )
-
-        layout_params = {
-            "scale": s_rel,
-            "s_channel": s_channel,
-            "correction": correction,
-            "codebook": codebook_out,
-            "group_size": group_size,
-            "convrot_groupsize": convrot_groupsize,
-            "orig_dtype": tensor.dtype,
-        }
-        return qdata, layout_params
-
-    @staticmethod
-    def dequantize(
-        qdata: torch.Tensor,
-        s_rel: torch.Tensor | None = None,
-        scale: torch.Tensor | None = None,
-        s_channel: torch.Tensor | None = None,
-        codebook: torch.Tensor | None = None,
-        correction: torch.Tensor | None = None,
-        group_size: int = 16,
-        convrot_groupsize: int = 256,
-        orig_dtype: torch.dtype = torch.bfloat16,
-        output_dtype: torch.dtype | None = None,
-        **kwargs,
-    ):
-        target_dtype = output_dtype or orig_dtype or torch.bfloat16
-        rel_scale = s_rel if s_rel is not None else scale
-        try:
-            from comfy_kitchen.tensor.w4a8_int8 import dequantize_w4a8_int8_weight
-            return dequantize_w4a8_int8_weight(
-                qdata,
-                rel_scale,
-                s_channel,
-                codebook=codebook,
-                correction=correction,
-                group_size=group_size,
-                convrot_groupsize=convrot_groupsize,
-                output_dtype=target_dtype,
-            )
-        except Exception:
-            from ..converters.w4a8_int8_converter import dequantize_w4a8_int8_pytorch
-            return dequantize_w4a8_int8_pytorch(
-                qdata,
-                rel_scale,
-                s_channel,
-                codebook=codebook,
-                correction=correction,
-                group_size=group_size,
-                convrot_groupsize=convrot_groupsize,
-                output_dtype=target_dtype,
-            )
-
-    @classmethod
-    def get_plain_tensors(cls, qtensor):
-        p = qtensor._layout_params
-        return qtensor._qdata, p["scale"], p["s_channel"], p.get("correction"), p.get("codebook")
-
-
-# Note: group_size here is a fallback if per-tensor .comfy_quant metadata doesn't specify it.
-# Prefer always storing group_size in per-tensor metadata during conversion.
-QUANT_ALGOS = {
-    "float8_e4m3fn": {"storage_t": torch.float8_e4m3fn, "parameters": {"weight_scale", "input_scale"}, "comfy_tensor_layout": "TensorCoreFP8Layout"},
-    "float8_e4m3fn_rowwise": {"storage_t": torch.float8_e4m3fn, "parameters": {"weight_scale", "input_scale"}, "comfy_tensor_layout": "RowWiseFP8Layout"},
-    "float8_e4m3fn_blockwise": {
-        "storage_t": torch.float8_e4m3fn,
-        "parameters": {"weight_scale", "input_scale"},
-        "comfy_tensor_layout": "BlockWiseFP8Layout",
-        "group_size": 64,  # Fallback if per-tensor metadata missing
-    },
-    "int8_blockwise": {
-        "storage_t": torch.int8,
-        "parameters": {"weight_scale", "input_scale"},
-        "comfy_tensor_layout": "BlockWiseINT8Layout",
-        "group_size": 128,  # Fallback if per-tensor metadata missing
-        "asymmetric_layout": True,
-    },
-    "int8_tensorwise": {"storage_t": torch.int8, "parameters": {"weight_scale", "input_scale"}, "comfy_tensor_layout": "TensorWiseINT8Layout"},
-    "convrot_w4a4": {
-        "storage_t": torch.int8,
-        "parameters": {"weight_scale"},
-        "comfy_tensor_layout": "TensorCoreConvRotW4A4Layout",
-        "group_size": 64,
-    },
-    "w4a8_int8": {
-        "storage_t": torch.int8,
-        "parameters": {"weight_scale", "_s_rel", "_s_channel", "_correction", "_codebook"},
-        "comfy_tensor_layout": "AsymW4A8Int8Layout",
-        "group_size": 16,
-    },
-    "asym_w4a8_int8": {
-        "storage_t": torch.int8,
-        "parameters": {"weight_scale", "_s_rel", "_s_channel", "_correction", "_codebook"},
-        "comfy_tensor_layout": "AsymW4A8Int8Layout",
-        "group_size": 16,
-    },
-    "w4a8": {
-        "storage_t": torch.int8,
-        "parameters": {"weight_scale", "_s_rel", "_s_channel", "_correction", "_codebook"},
-        "comfy_tensor_layout": "AsymW4A8Int8Layout",
-        "group_size": 16,
-    },
-}
-
+# Layout Registry
 LAYOUTS = {
-    "TensorCoreFP8Layout": TensorCoreFP8Layout,
-    "RowWiseFP8Layout": RowWiseFP8Layout,
-    "BlockWiseFP8Layout": BlockWiseFP8Layout,
-    "BlockWiseINT8Layout": BlockWiseINT8Layout,
-    "TensorWiseINT8Layout": TensorWiseINT8Layout,
     "TensorCoreConvRotW4A4Layout": TensorCoreConvRotW4A4Layout,
-    "AsymW4A8Int8Layout": AsymW4A8Int8Layout,
+}
+
+QUANT_ALGOS = {
+    "convrot_w4a4": {
+        "layout_params": ["scale"],
+        "comfy_tensor_layout": "TensorCoreConvRotW4A4Layout",
+    },
 }
 
 
-
-@register_layout_op(torch.ops.aten.linear.default, "TensorCoreFP8Layout")
-def fp8_linear(func, args, kwargs):
-    input_tensor = args[0]
-    weight = args[1]
-    bias = args[2] if len(args) > 2 else None
-
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        plain_input, scale_a = TensorCoreFP8Layout.get_plain_tensors(input_tensor)
-        plain_weight, scale_b = TensorCoreFP8Layout.get_plain_tensors(weight)
-
-        out_dtype = kwargs.get("out_dtype")
-        if out_dtype is None:
-            out_dtype = input_tensor._layout_params["orig_dtype"]
-
-        weight_t = plain_weight.t()
-
-        tensor_2d = False
-        if len(plain_input.shape) == 2:
-            tensor_2d = True
-            plain_input = plain_input.unsqueeze(1)
-
-        input_shape = plain_input.shape
-        if len(input_shape) != 3:
-            return None
-
-        try:
-            output = torch._scaled_mm(plain_input.reshape(-1, input_shape[2]).contiguous(), weight_t, bias=bias, scale_a=scale_a, scale_b=scale_b, out_dtype=out_dtype)
-
-            if isinstance(output, tuple):  # TODO: remove when we drop support for torch 2.4
-                output = output[0]
-
-            if not tensor_2d:
-                output = output.reshape((-1, input_shape[1], weight.shape[0]))
-
-            if output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-                output_scale = scale_a * scale_b
-                output_params = {"scale": output_scale, "orig_dtype": input_tensor._layout_params["orig_dtype"]}
-                return QuantizedTensor(output, "TensorCoreFP8Layout", output_params)
-            else:
-                return output
-
-        except Exception as e:
-            raise RuntimeError(f"FP8 _scaled_mm failed, falling back to dequantization: {e}")
-
-    # Case 2: DQ Fallback
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-
-    return torch.nn.functional.linear(input_tensor, weight, bias)
-
-
-def fp8_mm_(input_tensor, weight, bias=None, out_dtype=None):
-    if out_dtype is None:
-        out_dtype = input_tensor._layout_params["orig_dtype"]
-
-    plain_input, scale_a = TensorCoreFP8Layout.get_plain_tensors(input_tensor)
-    plain_weight, scale_b = TensorCoreFP8Layout.get_plain_tensors(weight)
-
-    output = torch._scaled_mm(plain_input.contiguous(), plain_weight, bias=bias, scale_a=scale_a, scale_b=scale_b, out_dtype=out_dtype)
-
-    if isinstance(output, tuple):  # TODO: remove when we drop support for torch 2.4
-        output = output[0]
-    return output
-
-
-@register_layout_op(torch.ops.aten.addmm.default, "TensorCoreFP8Layout")
-def fp8_addmm(func, args, kwargs):
-    input_tensor = args[1]
-    weight = args[2]
-    bias = args[0]
-
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        return fp8_mm_(input_tensor, weight, bias=bias, out_dtype=kwargs.get("out_dtype", None))
-
-    a = list(args)
-    if isinstance(args[0], QuantizedTensor):
-        a[0] = args[0].dequantize()
-    if isinstance(args[1], QuantizedTensor):
-        a[1] = args[1].dequantize()
-    if isinstance(args[2], QuantizedTensor):
-        a[2] = args[2].dequantize()
-
-    return func(*a, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.mm.default, "TensorCoreFP8Layout")
-def fp8_mm(func, args, kwargs):
-    input_tensor = args[0]
-    weight = args[1]
-
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        return fp8_mm_(input_tensor, weight, bias=None, out_dtype=kwargs.get("out_dtype", None))
-
-    a = list(args)
-    if isinstance(args[0], QuantizedTensor):
-        a[0] = args[0].dequantize()
-    if isinstance(args[1], QuantizedTensor):
-        a[1] = args[1].dequantize()
-    return func(*a, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.view.default, "TensorCoreFP8Layout")
-@register_layout_op(torch.ops.aten.t.default, "TensorCoreFP8Layout")
-def fp8_func(func, args, kwargs):
-    input_tensor = args[0]
-    if isinstance(input_tensor, QuantizedTensor):
-        plain_input, scale_a = TensorCoreFP8Layout.get_plain_tensors(input_tensor)
-        ar = list(args)
-        ar[0] = plain_input
-        return QuantizedTensor(func(*ar, **kwargs), "TensorCoreFP8Layout", input_tensor._layout_params)
-    return func(*args, **kwargs)
-
-
 # ==============================================================================
-# Row-Wise FP8 Operation Handlers (dequant-fallback)
+# INT4 ConvRot W4A4 Layout Operation Handlers
 # ==============================================================================
-
-
-@register_layout_op(torch.ops.aten.linear.default, "RowWiseFP8Layout")
-def rowwise_fp8_linear(func, args, kwargs):
-    """
-    Row-wise FP8 linear operation.
-    Uses dequant-fallback since torch._scaled_mm doesn't support per-row scales.
-    """
-    input_tensor = args[0]
-    weight = args[1]
-    bias = args[2] if len(args) > 2 else None
-
-    # Dequantize weight (always needed for row-wise)
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-
-    # Dequantize input if also quantized
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-
-    return torch.nn.functional.linear(input_tensor, weight, bias)
-
-
-@register_layout_op(torch.ops.aten.mm.default, "RowWiseFP8Layout")
-def rowwise_fp8_mm(func, args, kwargs):
-    """Row-wise FP8 matrix multiplication (dequant-fallback)."""
-    input_tensor = args[0]
-    weight = args[1]
-
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-
-    return func(input_tensor, weight)
-
-
-@register_layout_op(torch.ops.aten.addmm.default, "RowWiseFP8Layout")
-def rowwise_fp8_addmm(func, args, kwargs):
-    """Row-wise FP8 addmm operation (dequant-fallback)."""
-    bias = args[0]
-    input_tensor = args[1]
-    weight = args[2]
-
-    if isinstance(bias, QuantizedTensor):
-        bias = bias.dequantize()
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-
-    return func(bias, input_tensor, weight, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.view.default, "RowWiseFP8Layout")
-@register_layout_op(torch.ops.aten.t.default, "RowWiseFP8Layout")
-def rowwise_fp8_func(func, args, kwargs):
-    """Handle view/transpose for row-wise FP8 tensors."""
-    input_tensor = args[0]
-    if isinstance(input_tensor, QuantizedTensor):
-        plain_input, scale = RowWiseFP8Layout.get_plain_tensors(input_tensor)
-        ar = list(args)
-        ar[0] = plain_input
-        return QuantizedTensor(func(*ar, **kwargs), "RowWiseFP8Layout", input_tensor._layout_params)
-    return func(*args, **kwargs)
-
-
-# ==============================================================================
-# Block-Wise FP8 Operation Handlers (dequant-fallback)
-# ==============================================================================
-
-
-@register_layout_op(torch.ops.aten.linear.default, "BlockWiseFP8Layout")
-def blockwise_fp8_linear(func, args, kwargs):
-    """
-    Block-wise FP8 linear operation.
-    Uses dequant-fallback since torch._scaled_mm doesn't support 2D block scales.
-    """
-    input_tensor = args[0]
-    weight = args[1]
-    bias = args[2] if len(args) > 2 else None
-
-    # Dequantize weight (always needed for block-wise)
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-
-    # Dequantize input if also quantized
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-
-    return torch.nn.functional.linear(input_tensor, weight, bias)
-
-
-@register_layout_op(torch.ops.aten.mm.default, "BlockWiseFP8Layout")
-def blockwise_fp8_mm(func, args, kwargs):
-    """Block-wise FP8 matrix multiplication (dequant-fallback)."""
-    input_tensor = args[0]
-    weight = args[1]
-
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-
-    return func(input_tensor, weight)
-
-
-@register_layout_op(torch.ops.aten.addmm.default, "BlockWiseFP8Layout")
-def blockwise_fp8_addmm(func, args, kwargs):
-    """Block-wise FP8 addmm operation (dequant-fallback)."""
-    bias = args[0]
-    input_tensor = args[1]
-    weight = args[2]
-
-    if isinstance(bias, QuantizedTensor):
-        bias = bias.dequantize()
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-
-    return func(bias, input_tensor, weight, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.view.default, "BlockWiseFP8Layout")
-@register_layout_op(torch.ops.aten.t.default, "BlockWiseFP8Layout")
-def blockwise_fp8_func(func, args, kwargs):
-    """Handle view/transpose for block-wise FP8 tensors."""
-    input_tensor = args[0]
-    if isinstance(input_tensor, QuantizedTensor):
-        plain_input, scale, block_size = BlockWiseFP8Layout.get_plain_tensors(input_tensor)
-        ar = list(args)
-        ar[0] = plain_input
-        return QuantizedTensor(func(*ar, **kwargs), "BlockWiseFP8Layout", input_tensor._layout_params)
-    return func(*args, **kwargs)
-
-
-# ==============================================================================
-# Block-Wise INT8 Operation Handlers
-# ==============================================================================
-
-
-def _int8_gemm_pytorch_fallback(a_int8, a_scale, b_int8, b_scale, block_size, bias=None):
-    """
-    PyTorch fallback for INT8 matrix multiplication: dequantize and use standard matmul.
-
-    Args:
-        a_int8: INT8 activations, shape (*batch, K)
-        a_scale: Activation scales, shape (*batch, K//block_size)
-        b_int8: INT8 weights, shape (N, K) - standard PyTorch weight format
-        b_scale: Weight scales, shape (N//block_size, K//block_size)
-        block_size: Block size for quantization
-        bias: Optional bias vector, shape (N,)
-
-    Returns:
-        Output in float32, shape (*batch, N)
-    """
-    K = a_int8.shape[-1]
-    batch_shape = a_int8.shape[:-1]
-    N = b_int8.shape[0]
-
-    # Dequantize activations
-    # Ensure a_scale has the correct shape - it should be (*batch_shape, K // block_size)
-    expected_scale_shape = (*batch_shape, K // block_size)
-    if a_scale.shape != expected_scale_shape:
-        # Try to reshape if the number of elements matches
-        expected_numel = 1
-        for dim in expected_scale_shape:
-            expected_numel *= dim
-        if a_scale.numel() == expected_numel:
-            a_scale = a_scale.reshape(expected_scale_shape)
-        else:
-            raise RuntimeError(f"Scale shape mismatch: a_scale.shape={a_scale.shape}, expected {expected_scale_shape}. " + f"a_int8.shape={a_int8.shape}, K={K}, block_size={block_size}")
-
-    a_blocked = a_int8.reshape(*batch_shape, K // block_size, block_size)
-    a_scale_broadcast = a_scale.unsqueeze(-1)
-    a_fp32 = a_blocked.to(torch.float32) * a_scale_broadcast
-    a_fp32 = a_fp32.reshape(*batch_shape, K)
-
-    # Dequantize weights
-    # b_int8 is in (N, K) format (standard weight format), b_scale is in (N//block_size, K//block_size) format
-    expected_weight_scale_shape = (N // block_size, K // block_size)
-    if b_scale.shape != expected_weight_scale_shape:
-        # Try to reshape if the number of elements matches
-        expected_weight_numel = (N // block_size) * (K // block_size)
-        if b_scale.numel() == expected_weight_numel:
-            b_scale = b_scale.reshape(expected_weight_scale_shape)
-        else:
-            raise RuntimeError(f"Weight scale shape mismatch: b_scale.shape={b_scale.shape}, expected {expected_weight_scale_shape}. " + f"b_int8.shape={b_int8.shape}, N={N}, K={K}, block_size={block_size}")
-
-    # Dequantize weight: (N, K) -> blocks -> dequantize -> (N, K)
-    b_blocked = b_int8.reshape(N // block_size, block_size, K // block_size, block_size)
-    b_blocked = b_blocked.permute(0, 2, 1, 3)  # (N//bs, K//bs, bs, bs)
-    b_scale_broadcast = b_scale.unsqueeze(-1).unsqueeze(-1)
-    b_fp32 = b_blocked.to(torch.float32) * b_scale_broadcast
-    b_fp32 = b_fp32.permute(0, 2, 1, 3).reshape(N, K)  # Back to (N, K)
-
-    output = torch.nn.functional.linear(a_fp32, b_fp32, bias)
-    return output
-
-
-def _int8_gemm_triton_or_fallback(a_int8, a_scale, b_int8, b_scale, block_size, bias=None, out_quant=False):
-    """
-    INT8 matrix multiplication with optional fused bias using Triton kernels or PyTorch fallback.
-
-    Args:
-        a_int8: INT8 activations, shape (*batch, K)
-        a_scale: Activation scales, shape (*batch, K//block_size)
-        b_int8: INT8 weights, shape (N, K) - standard PyTorch weight format
-        b_scale: Weight scales, shape (N//block_size, K//block_size)
-        block_size: Block size for quantization
-        bias: Optional bias vector, shape (N,)
-        out_quant: If True, return quantized output (INT8 + scales) instead of float
-
-    Returns:
-        If out_quant=False: Output in float16/float32, shape (*batch, N)
-        If out_quant=True: Tuple of (output_int8, output_scale)
-    """
-    K = a_int8.shape[-1]
-    batch_shape = a_int8.shape[:-1]
-    # b_int8 is weight in (N, K) format (standard PyTorch weight format)
-    N = b_int8.shape[0]
-    assert b_int8.shape[1] == K, f"Weight shape mismatch: expected b_int8.shape[1]={K}, got {b_int8.shape[1]}"
-
-    # Try Triton kernel first (only if tensors are on CUDA)
-    if _HAS_TRITON_INT8 and a_int8.is_cuda:
-        try:
-            # int8_gemm/int8_addmm expects: (a, a_s, b, b_s, [bias])
-            # a: (*batch, K), a_s: (*batch, K//block_size)
-            # b: (N, K), b_s: (N//block_size, K//block_size)
-            # Triton kernels transpose b internally
-
-            # Reshape activations to 2D for int8_gemm
-            a_2d = a_int8.reshape(-1, K).contiguous()
-            a_scale_2d = a_scale.reshape(-1, a_scale.shape[-1]).contiguous()
-
-            # Ensure weight tensors are contiguous
-            b_int8_c = b_int8.contiguous()
-            b_scale_c = b_scale.contiguous()
-
-            # Call appropriate Triton kernel based on out_quant flag
-            if out_quant:
-                # Use fused matmul + quantization kernels
-                if bias is not None:
-                    # Fused addmm + quantization
-                    output_2d, output_scale_2d = triton_int8_addmm_quant(a_2d, a_scale_2d, b_int8_c, b_scale_c, bias, out_block_size=block_size)
-                else:
-                    # Fused gemm + quantization
-                    output_2d, output_scale_2d = triton_int8_gemm_quant(a_2d, a_scale_2d, b_int8_c, b_scale_c, out_block_size=block_size)
-
-                # Reshape back to original batch shape
-                output = output_2d.reshape(*batch_shape, N)
-                output_scale = output_scale_2d.reshape(*batch_shape, N // block_size)
-                return output, output_scale
-            else:
-                # Standard float output
-                if bias is not None:
-                    # Use fused addmm kernel
-                    output_2d = triton_int8_addmm(a_2d, a_scale_2d, b_int8_c, b_scale_c, bias)
-                else:
-                    # Use standard gemm kernel
-                    output_2d = triton_int8_gemm(a_2d, a_scale_2d, b_int8_c, b_scale_c)
-
-                # Reshape back to original batch shape
-                output = output_2d.reshape(*batch_shape, N)
-                return output
-        except Exception as e:
-            logging.warning(f"Triton int8_gemm/addmm failed: {e}, falling back to PyTorch")
-            raise e
-
-    # Use PyTorch fallback
-    fallback_output = _int8_gemm_pytorch_fallback(a_int8, a_scale, b_int8, b_scale, block_size, bias)
-
-    # If out_quant is requested, quantize the fallback output
-    if out_quant:
-        # Use PyTorch activation quantization on the output
-        from .int8_kernels import act_quant
-
-        try:
-            output_int8, output_scale = act_quant(fallback_output, block_size=block_size)
-            return output_int8, output_scale
-        except Exception:
-            # Fallback to CPU quantization if Triton not available
-            output_int8, output_scale = BlockWiseINT8Layout._activation_quantize_pytorch(fallback_output, block_size)
-            return output_int8, output_scale
-
-    return fallback_output
-
-
-@register_layout_op(torch.ops.aten.linear.default, "BlockWiseINT8Layout")
-def int8_linear(func, args, kwargs):
-    """
-    Block-wise INT8 linear operation handler with fused Triton kernel support.
-
-    Supports:
-    - Both quantized input and weight (uses Triton int8_addmm with fused bias)
-    - Mixed precision (quantized weight, float input)
-    - Optional quantized output via out_dtype and out_quant parameters
-    """
-    input_tensor = args[0]
-    weight = args[1]
-    bias = args[2] if len(args) > 2 else None
-
-    # Case 1: Both input and weight are quantized
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        # Extract quantized data
-        a_int8, a_scale, a_block_size, a_is_weight = BlockWiseINT8Layout.get_plain_tensors(input_tensor)
-        b_int8, b_scale, b_block_size, b_is_weight = BlockWiseINT8Layout.get_plain_tensors(weight)
-
-        # Verify configurations
-        assert not a_is_weight, "Input tensor should not be marked as weight"
-        assert b_is_weight, "Weight tensor should be marked as weight"
-        assert a_block_size == b_block_size, f"Block sizes must match: {a_block_size} vs {b_block_size}"
-
-        orig_dtype = input_tensor._layout_params["orig_dtype"]
-        out_dtype = kwargs.get("out_dtype", orig_dtype)
-        out_quant = kwargs.get("out_quant", False)  # Whether to return quantized output
-
-        # Weight is already in (N, K) format (standard PyTorch weight format)
-        # Pass out_quant to _int8_gemm_triton_or_fallback for fused matmul+quant
-        result = _int8_gemm_triton_or_fallback(a_int8, a_scale, b_int8, b_scale, a_block_size, bias=bias, out_quant=out_quant)
-
-        # Handle quantized vs float output
-        if out_quant:
-            # Result is (output_int8, output_scale) tuple
-            output_int8, output_scale = result
-
-            # Wrap in QuantizedTensor
-            layout_params = {"scale": output_scale, "block_size": a_block_size, "is_weight": False, "orig_dtype": out_dtype}
-            return QuantizedTensor(output_int8, "BlockWiseINT8Layout", layout_params)
-        else:
-            # Result is float tensor
-            output = result
-            # Convert to target dtype if needed
-            if output.dtype != out_dtype:
-                output = output.to(out_dtype)
-            return output
-
-    # Case 2: Fallback - dequantize and use standard linear
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-
-    return torch.nn.functional.linear(input_tensor, weight, bias)
-
-
-@register_layout_op(torch.ops.aten.mm.default, "BlockWiseINT8Layout")
-def int8_mm(func, args, kwargs):
-    """Block-wise INT8 matrix multiplication handler with Triton kernel support."""
-    input_tensor = args[0]
-    weight = args[1]
-
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        a_int8, a_scale, a_block_size, a_is_weight = BlockWiseINT8Layout.get_plain_tensors(input_tensor)
-        b_int8, b_scale, b_block_size, b_is_weight = BlockWiseINT8Layout.get_plain_tensors(weight)
-
-        assert a_block_size == b_block_size, f"Block sizes must match: {a_block_size} vs {b_block_size}"
-
-        # Note: For mm, we expect both to be 2D
-        # If input is marked as weight (2D blocking), we need different logic
-        # For simplicity, dequantize if configurations don't match expected pattern
-        if a_is_weight or not b_is_weight:
-            logging.warning("INT8 mm: Unexpected tensor configurations, falling back to dequantization")
-            return func(input_tensor.dequantize(), weight.dequantize())
-
-        orig_dtype = input_tensor._layout_params["orig_dtype"]
-        out_dtype = kwargs.get("out_dtype", orig_dtype)
-        out_quant = kwargs.get("out_quant", False)  # Whether to return quantized output (default: True)
-
-        # Check if weight needs to be transposed to (N, K) format
-        # For mm: input is (M, K), weight should be (N, K) for the kernel
-        K = a_int8.shape[-1]
-        if b_int8.shape[0] == K and b_int8.shape[1] != K:
-            # Weight is in (K, N) format (transposed), transpose back to (N, K)
-            b_int8 = b_int8.t().contiguous()
-            b_scale = b_scale.t().contiguous()
-
-        result = _int8_gemm_triton_or_fallback(a_int8, a_scale, b_int8, b_scale, a_block_size, bias=None, out_quant=out_quant)
-
-        # Handle quantized vs float output
-        if out_quant:
-            # Result is (output_int8, output_scale) tuple
-            output_int8, output_scale = result
-
-            # Wrap in QuantizedTensor
-            layout_params = {"scale": output_scale, "block_size": a_block_size, "is_weight": False, "orig_dtype": out_dtype}
-            return QuantizedTensor(output_int8, "BlockWiseINT8Layout", layout_params)
-        else:
-            # Result is float tensor
-            output = result
-            # Convert to target dtype if needed
-            if output.dtype != out_dtype:
-                output = output.to(out_dtype)
-            return output
-
-    # Fallback
-    a = list(args)
-    if isinstance(args[0], QuantizedTensor):
-        a[0] = args[0].dequantize()
-    if isinstance(args[1], QuantizedTensor):
-        a[1] = args[1].dequantize()
-    return func(*a, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.addmm.default, "BlockWiseINT8Layout")
-def int8_addmm(func, args, kwargs):
-    """
-    Block-wise INT8 addmm operation handler with fused Triton kernel support.
-    addmm: out = beta * input + alpha * (mat1 @ mat2)
-
-    This uses the fused int8_addmm kernel which combines matmul and bias addition
-    in a single pass for better performance.
-
-    Args:
-        args[0]: bias tensor
-        args[1]: mat1 (input)
-        args[2]: mat2 (weight)
-    """
-    bias = args[0]
-    input_tensor = args[1]
-    weight = args[2]
-
-    # Case 1: Both input and weight are quantized
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        # Extract quantized data
-        a_int8, a_scale, a_block_size, a_is_weight = BlockWiseINT8Layout.get_plain_tensors(input_tensor)
-        b_int8, b_scale, b_block_size, b_is_weight = BlockWiseINT8Layout.get_plain_tensors(weight)
-
-        # Verify configurations
-        assert a_block_size == b_block_size, f"Block sizes must match: {a_block_size} vs {b_block_size}"
-
-        orig_dtype = input_tensor._layout_params["orig_dtype"]
-        out_dtype = kwargs.get("out_dtype", orig_dtype)
-        out_quant = kwargs.get("out_quant", False)  # Whether to return quantized output
-
-        # PyTorch's F.linear internally calls addmm(bias, input, weight.t())
-        # So weight arrives in (K, N) format (transposed), need to transpose back to (N, K)
-        # Check if weight is transposed by comparing dimensions with input
-        K = a_int8.shape[-1]
-        if b_is_weight and b_int8.shape[0] == K:
-            # Weight is in (K, N) format (transposed), transpose back to (N, K)
-            # The transpose handler also transposed the scale, so we need to transpose it back too
-            b_int8 = b_int8.t().contiguous()
-            b_scale = b_scale.t().contiguous()
-
-        # Use fused Triton kernel (combines matmul + bias + optional quant)
-        result = _int8_gemm_triton_or_fallback(a_int8, a_scale, b_int8, b_scale, a_block_size, bias=bias, out_quant=out_quant)
-
-        # Handle quantized vs float output
-        if out_quant:
-            # Result is (output_int8, output_scale) tuple
-            output_int8, output_scale = result
-
-            # Wrap in QuantizedTensor
-            layout_params = {"scale": output_scale, "block_size": a_block_size, "is_weight": False, "orig_dtype": out_dtype}
-            return QuantizedTensor(output_int8, "BlockWiseINT8Layout", layout_params)
-        else:
-            # Result is float tensor
-            output = result
-            # Convert to target dtype if needed
-            if output.dtype != out_dtype:
-                output = output.to(out_dtype)
-            return output
-
-    # Fallback: dequantize and use standard addmm
-    a = list(args)
-    if isinstance(args[0], QuantizedTensor):
-        a[0] = args[0].dequantize()
-    if isinstance(args[1], QuantizedTensor):
-        a[1] = args[1].dequantize()
-    if isinstance(args[2], QuantizedTensor):
-        a[2] = args[2].dequantize()
-
-    return func(*a, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.view.default, "BlockWiseINT8Layout")
-def int8_view(func, args, kwargs):
-    """Handle view operations for INT8 tensors."""
-    input_tensor = args[0]
-    if isinstance(input_tensor, QuantizedTensor):
-        # For view, we need to be careful with block structure
-        # For safety, we'll allow these ops but note that they might break block alignment
-        plain_input = input_tensor._qdata
-        ar = list(args)
-        ar[0] = plain_input
-        transformed = func(*ar, **kwargs)
-
-        # Return new QuantizedTensor with same layout params
-        # Note: This assumes the transformation preserves block structure
-        return QuantizedTensor(transformed, "BlockWiseINT8Layout", input_tensor._layout_params)
-    return func(*args, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.t.default, "BlockWiseINT8Layout")
-def int8_transpose(func, args, kwargs):
-    """Handle transpose operations for INT8 tensors."""
-    input_tensor = args[0]
-    if isinstance(input_tensor, QuantizedTensor):
-        # Transpose the quantized data
-        plain_input = input_tensor._qdata
-        ar = list(args)
-        ar[0] = plain_input
-        transformed = func(*ar, **kwargs)
-
-        # For weight tensors, we need to transpose the scale tensor as well
-        new_layout_params = input_tensor._layout_params.copy()
-        if new_layout_params.get("is_weight", False):
-            # Transpose the scale tensor to match the transposed weight
-            new_layout_params["scale"] = new_layout_params["scale"].t().contiguous()
-
-        # Return new QuantizedTensor with updated layout params
-        return QuantizedTensor(transformed, "BlockWiseINT8Layout", new_layout_params)
-    return func(*args, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.transpose.int, "BlockWiseINT8Layout")
-def int8_transpose_int(func, args, kwargs):
-    """
-    Handle general transpose operations for INT8 tensors.
-
-    torch.transpose(input, dim0, dim1) swaps two dimensions.
-
-    For BlockWiseINT8Layout:
-    - Activations: quantized along last dimension, scale shape is (*batch_dims, K//block_size)
-      If we swap the last dimension, we need to adjust scale handling
-    - Weights: quantized in 2D blocks (M, N), scale shape is (M//block_size, N//block_size)
-      If we swap dimensions on a 2D weight, transpose the scale tensor too
-    """
-    input_tensor = args[0]
-    dim0 = args[1] if len(args) > 1 else kwargs.get("dim0", 0)
-    dim1 = args[2] if len(args) > 2 else kwargs.get("dim1", 1)
-
-    if isinstance(input_tensor, QuantizedTensor):
-        # Transpose the quantized data
-        plain_input = input_tensor._qdata
-        ar = list(args)
-        ar[0] = plain_input
-        transformed = func(*ar, **kwargs)
-
-        # Copy layout params
-        new_layout_params = input_tensor._layout_params.copy()
-        is_weight = new_layout_params.get("is_weight", False)
-
-        # Normalize dimensions to positive indices
-        ndim = plain_input.ndim
-        if dim0 < 0:
-            dim0 = ndim + dim0
-        if dim1 < 0:
-            dim1 = ndim + dim1
-
-        # Handle scale tensor transposition
-        if is_weight:
-            # For weight tensors (2D with block-wise quantization in both dims)
-            # If we're transposing the two dimensions of a 2D tensor, transpose scales too
-            if ndim == 2 and set([dim0, dim1]) == {0, 1}:
-                # Transposing a 2D weight tensor (M, N) -> (N, M)
-                # Scale goes from (M//block_size, N//block_size) -> (N//block_size, M//block_size)
-                new_layout_params["scale"] = new_layout_params["scale"].t().contiguous()
-            else:
-                # For higher dimensional weight tensors or partial transposes,
-                # we may need more complex scale handling
-                # For now, log a warning as this is an uncommon case
-                logging.warning(f"Transpose on weight tensor with dims ({dim0}, {dim1}) and shape {plain_input.shape}. Scale tensor may need adjustment for correct behavior.")
-        else:
-            # For activation tensors, block-wise quantization is along last dimension
-            # If we're swapping the last dimension, this changes the quantization structure
-            last_dim = ndim - 1
-            if dim0 == last_dim or dim1 == last_dim:
-                # The last dimension is being moved, which affects quantization blocks
-                # This is a complex case - for safety, we could:
-                # 1. Dequantize, transpose, requantize (safest but slower)
-                # 2. Try to adjust scale tensor (complex, error-prone)
-                # For now, log a warning and proceed with transposing the scale tensor
-                # The scale tensor dimensions follow the input dimensions except the last
-                # which is divided by block_size
-
-                # Determine how to transpose the scale tensor
-                # Scale shape is (*batch_dims, K//block_size) where K is the last dim of input
-                # When we transpose input dims, we need to transpose scale dims accordingly
-                # But the last scale dim always corresponds to the quantization blocks
-
-                # Simple heuristic: if transposing involves last dim and input has 3+ dims,
-                # we transpose the corresponding scale dimensions
-                scale = new_layout_params["scale"]
-                if scale.ndim >= 2:
-                    # Map input dimensions to scale dimensions
-                    # Scale has shape (*batch_dims, K//block_size)
-                    # If input has shape (*batch_dims, K), scale maps batch_dims directly
-                    # and last dim is K//block_size
-
-                    # For transpose, if we swap dims d0 and d1 in input:
-                    # - If d1 is last_dim (K), then in scale it's still last (K//block_size)
-                    # - If d0 is last_dim, same applies
-                    # - If neither is last_dim, transpose applies to batch dimensions
-
-                    if dim1 == last_dim:
-                        # Swapping some batch dim with the last dim
-                        # In scale, this means swapping that batch dim with last scale dim
-                        scale_dim0 = dim0  # Same batch dimension
-                        scale_dim1 = scale.ndim - 1  # Last dim of scale (K//block_size)
-                        new_layout_params["scale"] = scale.transpose(scale_dim0, scale_dim1).contiguous()
-                    elif dim0 == last_dim:
-                        # Swapping last dim with some batch dim
-                        scale_dim0 = scale.ndim - 1  # Last dim of scale
-                        scale_dim1 = dim1  # Same batch dimension
-                        new_layout_params["scale"] = scale.transpose(scale_dim0, scale_dim1).contiguous()
-                    else:
-                        # Swapping two batch dimensions (not involving last dim)
-                        # Transpose the same dimensions in scale
-                        new_layout_params["scale"] = scale.transpose(dim0, dim1).contiguous()
-                else:
-                    logging.warning(f"Transpose involves last dimension but scale tensor has shape {scale.shape}. Scale tensor may need adjustment.")
-            else:
-                # Transposing batch dimensions that don't affect the quantized dimension
-                # Transpose the same dimensions in scale tensor
-                scale = new_layout_params["scale"]
-                if scale.ndim > max(dim0, dim1):
-                    new_layout_params["scale"] = scale.transpose(dim0, dim1).contiguous()
-
-        # Return new QuantizedTensor with updated layout params
-        return QuantizedTensor(transformed, "BlockWiseINT8Layout", new_layout_params)
-
-    return func(*args, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.gelu.default, "BlockWiseINT8Layout")
-def int8_gelu(func, args, kwargs):
-    """
-    Block-wise INT8 GELU activation handler with fused Triton kernel support.
-
-    Supports quantized input -> GELU -> quantized output in a single fused kernel.
-    This avoids materializing full-precision intermediate results.
-    """
-    input_tensor = args[0]
-
-    # Case 1: Input is quantized - use fused kernel
-    if isinstance(input_tensor, QuantizedTensor):
-        # Extract quantized data
-        qdata, scale, block_size, is_weight = BlockWiseINT8Layout.get_plain_tensors(input_tensor)
-
-        orig_dtype = input_tensor._layout_params["orig_dtype"]
-
-        # Determine if we should use Triton kernel
-        if _HAS_TRITON_INT8 and qdata.is_cuda:
-            try:
-                # Import the Triton kernel
-                from .int8_kernels import int8_gelu as triton_int8_gelu
-
-                # Call fused kernel
-                output_qdata, output_scale = triton_int8_gelu(qdata, scale, block_size=block_size)
-
-                # Wrap result in QuantizedTensor
-                layout_params = {
-                    "scale": output_scale.to(torch.float32),
-                    "block_size": block_size,
-                    "is_weight": False,  # Output is always activation format
-                    "orig_dtype": orig_dtype,
-                }
-                return QuantizedTensor(output_qdata, "BlockWiseINT8Layout", layout_params)
-
-            except Exception as e:
-                logging.warning(f"Triton int8_gelu failed: {e}, falling back to dequantization")
-                # Fall through to dequantization fallback
-
-        # Fallback: dequantize, apply GELU, quantize
-        fp_input = input_tensor.dequantize()
-        fp_output = torch.nn.functional.gelu(fp_input)
-
-        # Quantize output
-        output_qdata, output_layout_params = BlockWiseINT8Layout.quantize(fp_output, block_size=block_size, is_weight=False)
-        output_layout_params["orig_dtype"] = orig_dtype
-
-        return QuantizedTensor(output_qdata, "BlockWiseINT8Layout", output_layout_params)
-
-    # Case 2: Input is not quantized - use standard GELU
-    return func(*args, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.add_.Tensor, "BlockWiseINT8Layout")
-def int8_add_(func, args, kwargs):
-    """
-    Block-wise INT8 in-place addition handler for LoRA application.
-
-    This operation is typically used when applying LoRA to weight matrices.
-    Since speed is not critical for this operation:
-    - If target is a weight: dequantize, add, then requantize as weight
-    - Otherwise: dequantize and fallback to regular addition
-
-    Args:
-        args[0]: Target tensor (self) to be modified in-place
-        args[1]: Tensor to add
-    """
-    target = args[0]
-
-    if isinstance(target, QuantizedTensor):
-        # Extract quantization parameters
-        _, _, block_size, is_weight = BlockWiseINT8Layout.get_plain_tensors(target)
-
-        # Only handle the weight case specially
-        if is_weight:
-            other = args[1]
-            orig_dtype = target._layout_params["orig_dtype"]
-
-            # Dequantize target
-            target_fp = target.dequantize()
-
-            # Dequantize other if it's also quantized
-            if isinstance(other, QuantizedTensor):
-                other_fp = other.dequantize()
-            else:
-                other_fp = other
-
-            # Perform addition
-            result_fp = target_fp + other_fp
-
-            # Requantize as weight
-            result_qdata, result_layout_params = BlockWiseINT8Layout.quantize(result_fp, block_size=block_size, is_weight=True)
-            result_layout_params["orig_dtype"] = orig_dtype
-
-            # Update target in-place by copying the new quantized data
-            target._qdata.copy_(result_qdata)
-            target._layout_params["scale"].copy_(result_layout_params["scale"])
-            return target
-
-    # For non-weight tensors or non-quantized tensors, use standard fallback
-    return QuantizedTensor._dequant_and_fallback(func, args, kwargs)
-
-
-@register_layout_op(torch.ops.aten.to.dtype, "BlockWiseINT8Layout")
-def int8_to_dtype(func, args, kwargs):
-    """
-    Block-wise INT8 dtype conversion handler.
-
-    This operation handles .to(dtype) calls on quantized tensors.
-    - If converting to torch.int8, do nothing (already in INT8 format)
-    - Otherwise, dequantize and fallback
-
-    Args:
-        args[0]: Input tensor
-        args[1]: Target dtype
-    """
-    input_tensor = args[0]
-    target_dtype = args[1] if len(args) > 1 else kwargs.get("dtype", None)
-
-    if isinstance(input_tensor, QuantizedTensor):
-        # If target dtype is int8, the tensor is already in INT8 format
-        if target_dtype == torch.int8:
-            # No conversion needed, return as-is
-            return input_tensor
-
-    # For any other dtype or non-quantized tensors, use standard fallback
-    return QuantizedTensor._dequant_and_fallback(func, args, kwargs)
-
-
-# ==============================================================================
-# Tensor-Wise INT8 Operation Handlers
-# ==============================================================================
-
-
-@register_layout_op(torch.ops.aten.linear.default, "TensorWiseINT8Layout")
-def tensorwise_int8_linear(func, args, kwargs):
-    """
-    Tensor-wise/Row-wise INT8 linear operation.
-    In the target ecosystem, int8_tensorwise handles both scalar and per-row scales.
-    """
-    from .int8_kernels import act_quant_rowwise, int8_gemm_per_row, int8_addmm_per_row
-    input_tensor = args[0]
-    weight = args[1]
-    bias = args[2] if len(args) > 2 else None
-
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        plain_input, scale_a, _ = TensorWiseINT8Layout.get_plain_tensors(input_tensor)
-        plain_weight, scale_b, _ = TensorWiseINT8Layout.get_plain_tensors(weight)
-
-        out_dtype = kwargs.get("out_dtype")
-        if out_dtype is None:
-            out_dtype = input_tensor._layout_params.get("orig_dtype", torch.float16)
-
-        # Detect Case: Row-wise vs Tensor-wise
-        # Row-wise: scale_b has N elements (one per output row). numel() > 1 guards against
-        # 1-element tensors (e.g. shape [1]) which are scalar tensor-wise scales stored
-        # as a 1D tensor — those must go through the scalar path, not per-row.
-        if scale_b.numel() > 1:
-            try:
-                if bias is not None:
-                    output = int8_addmm_per_row(plain_input, scale_a, plain_weight, scale_b, bias)
-                else:
-                    output = int8_gemm_per_row(plain_input, scale_a, plain_weight, scale_b)
-                return output.to(out_dtype)
-            except Exception as e:
-                logging.warning(f"Row-wise INT8 linear failed, falling back: {e}")
-                return torch.nn.functional.linear(input_tensor.dequantize(), weight.dequantize(), bias)
-        else:
-            # Traditional Tensor-wise path
-            # weight is (N, K), scaled_mm expects (K, N) if transposed, but here it expects RHS
-            weight_t = plain_weight.t()
-
-            # Input must be 2D for _scaled_mm
-            input_shape = plain_input.shape
-            if len(input_shape) > 2:
-                input_2d = plain_input.reshape(-1, input_shape[-1])
-            else:
-                input_2d = plain_input
-
-            try:
-                # torch._scaled_mm expects float inputs but performs scaled matmul
-                output = torch._scaled_mm(input_2d.float().contiguous(), weight_t.float().contiguous(), scale=float(scale_a * scale_b), bias=bias)
-
-                if isinstance(output, tuple):
-                    output = output[0]
-
-                if len(input_shape) > 2:
-                    output = output.reshape((*input_shape[:-1], weight.shape[0]))
-
-                return output.to(out_dtype)
-
-            except Exception as e:
-                logging.warning(f"Tensor-wise INT8 _scaled_mm failed, falling back to dequantization: {e}")
-                return torch.nn.functional.linear(input_tensor.dequantize(), weight.dequantize(), bias)
-
-    elif not isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        # Dynamic activation quantization (Row-wise behavior)
-        if weight._layout_params["scale"].dim() > 0:
-            q_input, scale_input = act_quant_rowwise(input_tensor)
-            plain_weight, scale_b, _ = TensorWiseINT8Layout.get_plain_tensors(weight)
-
-            out_dtype = input_tensor.dtype
-
-            try:
-                if bias is not None:
-                    output = int8_addmm_per_row(q_input, scale_input, plain_weight, scale_b, bias)
-                else:
-                    output = int8_gemm_per_row(q_input, scale_input, plain_weight, scale_b)
-                return output.to(out_dtype)
-            except Exception as e:
-                logging.warning(f"Row-wise INT8 linear dynamic act quant failed, falling back: {e}")
-                return torch.nn.functional.linear(input_tensor, weight.dequantize(), bias)
-
-    # Fallback
-    if isinstance(weight, QuantizedTensor):
-        weight = weight.dequantize()
-    if isinstance(input_tensor, QuantizedTensor):
-        input_tensor = input_tensor.dequantize()
-
-    return torch.nn.functional.linear(input_tensor, weight, bias)
-
-
-@register_layout_op(torch.ops.aten.mm.default, "TensorWiseINT8Layout")
-def tensorwise_int8_mm(func, args, kwargs):
-    from .int8_kernels import int8_gemm_per_row
-    input_tensor = args[0]
-    weight = args[1]
-
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        plain_input, scale_a, _ = TensorWiseINT8Layout.get_plain_tensors(input_tensor)
-        plain_weight, scale_b, _ = TensorWiseINT8Layout.get_plain_tensors(weight)
-
-        if scale_b.numel() > 1:
-            try:
-                return int8_gemm_per_row(plain_input, scale_a, plain_weight, scale_b)
-            except Exception as e:
-                logging.warning(f"Row-wise INT8 mm failed, falling back: {e}")
-                return func(input_tensor.dequantize(), weight.dequantize())
-        else:
-            try:
-                output = torch._scaled_mm(plain_input.float().contiguous(), plain_weight.float().contiguous(), scale=float(scale_a * scale_b))
-                if isinstance(output, tuple):
-                    output = output[0]
-                return output
-            except Exception as e:
-                logging.warning(f"Tensor-wise INT8 _scaled_mm failed, falling back to dequantization: {e}")
-                return func(input_tensor.dequantize(), weight.dequantize())
-
-    # Fallback
-    a = list(args)
-    if isinstance(args[0], QuantizedTensor):
-        a[0] = args[0].dequantize()
-    if isinstance(args[1], QuantizedTensor):
-        a[1] = args[1].dequantize()
-    return func(*a, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.addmm.default, "TensorWiseINT8Layout")
-def tensorwise_int8_addmm(func, args, kwargs):
-    from .int8_kernels import int8_addmm_per_row
-    bias = args[0]
-    input_tensor = args[1]
-    weight = args[2]
-
-    if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-        plain_input, scale_a, _ = TensorWiseINT8Layout.get_plain_tensors(input_tensor)
-        plain_weight, scale_b, _ = TensorWiseINT8Layout.get_plain_tensors(weight)
-
-        if scale_b.numel() > 1:
-            try:
-                return int8_addmm_per_row(plain_input, scale_a, plain_weight, scale_b, bias)
-            except Exception as e:
-                logging.warning(f"Row-wise INT8 addmm failed, falling back: {e}")
-                return func(bias, input_tensor.dequantize(), weight.dequantize(), **kwargs)
-        else:
-            try:
-                output = torch._scaled_mm(plain_input.float().contiguous(), plain_weight.float().contiguous(), scale=float(scale_a * scale_b), bias=bias)
-                if isinstance(output, tuple):
-                    output = output[0]
-                return output
-            except Exception as e:
-                logging.warning(f"Tensor-wise INT8 _scaled_mm failed, falling back to dequantization: {e}")
-                return func(bias, input_tensor.dequantize(), weight.dequantize(), **kwargs)
-
-    a = list(args)
-    if isinstance(args[0], QuantizedTensor):
-        a[0] = args[0].dequantize()
-    if isinstance(args[1], QuantizedTensor):
-        a[1] = args[1].dequantize()
-    if isinstance(args[2], QuantizedTensor):
-        a[2] = args[2].dequantize()
-    return func(*a, **kwargs)
-
-
-@register_layout_op(torch.ops.aten.view.default, "TensorWiseINT8Layout")
-@register_layout_op(torch.ops.aten.t.default, "TensorWiseINT8Layout")
-def tensorwise_int8_func(func, args, kwargs):
-    input_tensor = args[0]
-    if isinstance(input_tensor, QuantizedTensor):
-        plain_input, scale, is_weight = TensorWiseINT8Layout.get_plain_tensors(input_tensor)
-        ar = list(args)
-        ar[0] = plain_input
-        return QuantizedTensor(func(*ar, **kwargs), "TensorWiseINT8Layout", input_tensor._layout_params)
-    return func(*args, **kwargs)
-
-# ==============================================================================
-# ConvRot W4A4 INT4 Layout + Operation Handlers
-# ==============================================================================
-
-
 @register_layout_op(torch.ops.aten.linear.default, "TensorCoreConvRotW4A4Layout")
 def convrot_w4a4_linear_handler(func, args, kwargs):
     from .int4_kernels import convrot_w4a4_linear
+
     input_tensor = args[0]
     weight = args[1]
-    bias = args[2] if len(args) > 2 else None
+    bias = args[2] if len(args) > 2 else kwargs.get("bias", None)
 
-    if isinstance(weight, QuantizedTensor):
-        qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
-        convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
-        quant_group_size = weight._layout_params.get("quant_group_size", 64)
-        if isinstance(input_tensor, QuantizedTensor):
-            input_tensor = input_tensor.dequantize()
-        return convrot_w4a4_linear(
-            input_tensor,
-            qweight,
-            wscales,
-            bias=bias,
-            convrot_groupsize=convrot_groupsize,
-            quant_group_size=quant_group_size,
-        )
-    return func(*args, **kwargs)
+    qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
+    convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
+    quant_group_size = weight._layout_params.get("quant_group_size", 64)
+
+    return convrot_w4a4_linear(
+        input_tensor,
+        qweight,
+        wscales,
+        bias=bias,
+        convrot_groupsize=convrot_groupsize,
+        quant_group_size=quant_group_size,
+        linear_dtype="int4",
+    )
 
 
 @register_layout_op(torch.ops.aten.mm.default, "TensorCoreConvRotW4A4Layout")
 def convrot_w4a4_mm_handler(func, args, kwargs):
     from .int4_kernels import convrot_w4a4_linear
+
     input_tensor = args[0]
     weight = args[1]
 
-    if isinstance(weight, QuantizedTensor):
-        qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
-        convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
-        quant_group_size = weight._layout_params.get("quant_group_size", 64)
-        if isinstance(input_tensor, QuantizedTensor):
-            input_tensor = input_tensor.dequantize()
-        return convrot_w4a4_linear(
-            input_tensor,
-            qweight,
-            wscales,
-            bias=None,
-            convrot_groupsize=convrot_groupsize,
-            quant_group_size=quant_group_size,
-        )
-    return func(*args, **kwargs)
+    qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
+    convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
+    quant_group_size = weight._layout_params.get("quant_group_size", 64)
+
+    return convrot_w4a4_linear(
+        input_tensor,
+        qweight,
+        wscales,
+        bias=None,
+        convrot_groupsize=convrot_groupsize,
+        quant_group_size=quant_group_size,
+        linear_dtype="int4",
+    )
 
 
 @register_layout_op(torch.ops.aten.addmm.default, "TensorCoreConvRotW4A4Layout")
 def convrot_w4a4_addmm_handler(func, args, kwargs):
     from .int4_kernels import convrot_w4a4_linear
+
     bias = args[0]
     input_tensor = args[1]
     weight = args[2]
 
-    if isinstance(weight, QuantizedTensor):
-        qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
-        convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
-        quant_group_size = weight._layout_params.get("quant_group_size", 64)
-        if isinstance(input_tensor, QuantizedTensor):
-            input_tensor = input_tensor.dequantize()
-        return convrot_w4a4_linear(
-            input_tensor,
-            qweight,
-            wscales,
-            bias=bias,
-            convrot_groupsize=convrot_groupsize,
-            quant_group_size=quant_group_size,
-        )
-    return func(*args, **kwargs)
+    qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
+    convrot_groupsize = weight._layout_params.get("convrot_groupsize", 256)
+    quant_group_size = weight._layout_params.get("quant_group_size", 64)
+
+    return convrot_w4a4_linear(
+        input_tensor,
+        qweight,
+        wscales,
+        bias=bias,
+        convrot_groupsize=convrot_groupsize,
+        quant_group_size=quant_group_size,
+        linear_dtype="int4",
+    )
 
 
 @register_layout_op(torch.ops.aten.view.default, "TensorCoreConvRotW4A4Layout")
@@ -2300,4 +441,3 @@ def convrot_w4a4_func(func, args, kwargs):
         ar[0] = plain_input
         return QuantizedTensor(func(*ar, **kwargs), "TensorCoreConvRotW4A4Layout", input_tensor._layout_params)
     return func(*args, **kwargs)
-

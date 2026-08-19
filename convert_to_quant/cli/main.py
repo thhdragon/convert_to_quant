@@ -1,7 +1,7 @@
 """
 CLI main function for convert_to_quant.
 
-Entry point that handles argument parsing and dispatches to appropriate conversion functions.
+Entry point that handles argument parsing and dispatches to INT4 ConvRot W4A4 conversion.
 """
 
 import argparse
@@ -15,21 +15,12 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from ..config.layer_config import generate_config_template, get_layer_settings, load_layer_config
-from ..constants import MODEL_FILTERS, TARGET_FP8_DTYPE
-from ..formats.dequantization import dequantize_model
-from ..formats.format_migration import (
-    convert_fp8_scaled_to_comfy_quant,
-    scan_and_replace_comfy_quant_metadata,
-)
-from ..formats.fp8_conversion import convert_to_fp8_scaled
-from ..formats.hybrid_mxfp8_conversion import convert_to_hybrid_mxfp8
-from ..formats.int8_conversion import convert_int8_to_comfy_quant
-from ..formats.legacy_utils import add_legacy_input_scale, cleanup_fp8_scaled
-from ..formats.mxfp8_conversion import convert_to_mxfp8
-from ..formats.nvfp4_conversion import convert_to_nvfp4
-from ..formats.w4a8_int8_conversion import convert_to_w4a8_int8
+from ..constants import MODEL_FILTERS
+from ..formats.int4_conversion import convert_int4_to_comfy_quant
+from ..formats.int4_convrot_conversion import convert_to_int4_convrot
 from ..pinned_transfer import set_verbose as set_pinned_verbose
 from ..utils.comfy_quant import edit_comfy_quant
+from ..utils.logging import setup_logging
 from ..utils.parallel_utils import parse_devices
 from .argument_parser import (
     ADVANCED_ARGS,
@@ -42,52 +33,12 @@ from .argument_parser import (
 )
 
 
-def load_input_scales(path: str) -> dict:
-    """Load input scales from JSON or safetensors file.
-
-    Args:
-        path: Path to JSON file or safetensors model with .input_scale tensors
-
-    Returns:
-        Dict mapping layer base names to input_scale values (float)
-    """
-    if path.endswith(".json"):
-        with open(path) as f:
-            return json.load(f)
-    elif path.endswith(".safetensors"):
-        scales = {}
-        with safe_open(path, framework="pt") as f:
-            for key in f.keys():
-                if key.endswith(".input_scale"):
-                    base = key.rsplit(".input_scale", 1)[0]
-                    scales[base] = f.get_tensor(key).item()
-        return scales
-    else:
-        raise ValueError(f"Unsupported input scales format: {path}. Use .json or .safetensors")
-
-
 def extract_filter_flags(args) -> dict:
-    """Extract model filter flags from parsed args with validation.
-
-    Validates that every filter in MODEL_FILTERS has a corresponding
-    argparse attribute. Fails fast if argparse is missing a filter,
-    which indicates a bug (filter added to constants.py but not argument_parser.py).
-
-    Args:
-        args: Parsed argparse namespace
-
-    Returns:
-        Dict mapping filter names to bool values, e.g. {"radiance": True, "t5xxl": False}
-    """
+    """Extract model filter flags from parsed args with validation."""
     flags = {}
     for name in MODEL_FILTERS.keys():
-        if not hasattr(args, name):
-            raise RuntimeError(
-                f"BUG: Filter '{name}' in MODEL_FILTERS but not in argparse. Add --{name} to argument_parser.py"
-            )
-        if getattr(args, name):
+        if hasattr(args, name) and getattr(args, name):
             flags[name] = True
-
     return flags
 
 
@@ -102,18 +53,7 @@ def analyze_dry_run(args) -> None:
     layer_config = load_layer_config(args.layer_config) if args.layer_config else None
     filter_flags = extract_filter_flags(args)
 
-    if getattr(args, "int4", False):
-        primary_format = "int4"
-    elif getattr(args, "w4a8_int8", False):
-        primary_format = "w4a8_int8"
-    elif args.nvfp4:
-        primary_format = "nvfp4"
-    elif args.mxfp8:
-        primary_format = "mxfp8"
-    elif args.int8:
-        primary_format = "int8"
-    else:
-        primary_format = "fp8"
+    primary_format = "convrot_w4a4"
 
     routes = {}
     passthrough_count = 0
@@ -167,7 +107,7 @@ def analyze_dry_run(args) -> None:
                         route = str(settings["format"])
                 elif custom_pattern and custom_pattern.search(key):
                     route_kind = "custom"
-                    route = str(args.custom_type or primary_format)
+                    route = "convrot_w4a4"
                 else:
                     exclusion_reason = None
                     if exclude_pattern and exclude_pattern.search(key):
@@ -182,30 +122,8 @@ def analyze_dry_run(args) -> None:
                                 exclusion_reason = f"{filter_name} filter"
                                 break
                     if exclusion_reason:
-                        if args.fallback:
-                            route_kind = "fallback"
-                            route = str(args.fallback)
-                        else:
-                            route_kind = "skip"
-                            route = exclusion_reason
-
-                use_heuristic = args.custom_heur if route_kind == "custom" else args.heur
-                if use_heuristic and route_kind not in {"skip", "remove"}:
-                    active_block_size = args.block_size or 128
-                    if route_kind == "config" and settings and settings.get("block_size"):
-                        active_block_size = int(settings["block_size"])
-                    elif route_kind == "custom" and args.custom_block_size:
-                        active_block_size = int(args.custom_block_size)
-                    elif route_kind == "fallback" and args.fallback_block_size:
-                        active_block_size = int(args.fallback_block_size)
-                    if (
-                        shape[0] < active_block_size
-                        or shape[1] < active_block_size
-                        or shape[0] % active_block_size != 0
-                        or shape[1] % active_block_size != 0
-                    ):
                         route_kind = "skip"
-                        route = f"performance heuristic (block {active_block_size})"
+                        route = exclusion_reason
 
             route_label = f"{route_kind}:{route}"
             routes[route_label] = routes.get(route_label, 0) + 1
@@ -219,19 +137,15 @@ def analyze_dry_run(args) -> None:
     print("No output file was written.")
 
 
-from ..utils.logging import setup_logging
-
-
 def get_parser() -> MultiHelpArgumentParser:
-    """Create and return the argument parser."""
+    """Create and return the argument parser for INT4 ConvRot W4A4 conversion."""
     parser = MultiHelpArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Convert safetensors weights to Scaled FP8 format.\n\n"
-        "Default behavior: FP8 quantization with per-tensor scaling.\n"
-        "For INT8 and other experimental options, see --help-experimental.\n"
+        description="Convert safetensors weights to INT4 ConvRot W4A4 format.\n\n"
+        "Default behavior: INT4 W4A4 quantization with group-wise Hadamard rotation (ConvRot).\n"
         "For model-specific layer exclusions, see --help-filters.\n"
         "For advanced LR tuning and early stopping, see --help-advanced.\n"
-        "For conversion and utility modes, see --help-modes.",
+        "For utility modes, see --help-modes.",
         experimental_args=EXPERIMENTAL_ARGS,
         filter_args=FILTER_ARGS,
         advanced_args=ADVANCED_ARGS,
@@ -240,1605 +154,152 @@ def get_parser() -> MultiHelpArgumentParser:
         lora_args=LORA_ARGS,
     )
 
-    parser.add_argument(
-        "-i", "--input", type=str, required=True, help="Input safetensors file path."
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=str,
-        help="Output safetensors file path. Auto-generated if not provided.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume quantization from existing sidecar progress file if present.",
-    )
-    parser.add_argument(
-        "--sidecar-path",
-        "--sidecar_path",
-        type=str,
-        default=None,
-        dest="sidecar_path",
-        help="Custom path for the sidecar progress JSON file.",
-    )
-    parser.add_argument(
-        "--max-shard-size",
-        "--max_shard_size",
-        type=str,
-        default=None,
-        dest="max_shard_size",
-        help="Maximum size per output safetensors shard (e.g. '5GB', '2000MB').",
-    )
-    parser.add_argument(
-        "--no-checkpoint",
-        "--no_checkpoint",
-        action="store_true",
-        dest="no_checkpoint",
-        help="Disable sidecar progress tracking and per-layer checkpoint saving.",
-    )
-    parser.add_argument(
-        "--comfy_quant",
-        "--comfy-quant",
-        action="store_true",
-        dest="comfy_quant",
-        help="Use Comfy quantization method.",
-    )
-    parser.add_argument(
-        "--int8", action="store_true", help="Use INT8 block-wise quantization instead of FP8."
-    )
-    parser.add_argument(
-        "-4",
-        "--int4",
-        "--w4a4",
-        action="store_true",
-        dest="int4",
-        help="Use INT4 W4A4 ConvRot quantization.",
-    )
-    parser.add_argument(
-        "--convrot",
-        action="store_true",
-        help="Enable group-wise Hadamard rotation (ConvRot) for INT8/INT4 row-wise quantization to improve quality.",
-    )
-
-    parser.add_argument(
-        "--convrot-group-size",
-        "--convrot_group_size",
-        type=int,
-        default=256,
-        dest="convrot_group_size",
-        help="Group size for ConvRot. Default: 256. (Dimensions < 256 are copied untouched in bf16)",
-    )
-    parser.add_argument(
-        "--dynamic-convrot",
-        "--dynamic_convrot",
-        action="store_true",
-        dest="dynamic_convrot",
-        help="Enable group-wise Hadamard rotation (ConvRot) with static group size 256 (dimensions < 256 copied untouched in bf16).",
-    )
-    parser.add_argument(
-        "--w4a4-untouched-activations",
-        "--w4a4_untouched_activations",
-        action="store_true",
-        dest="w4a4_untouched_activations",
-        help="For W4A4 ConvRot quantization, leave calibration activations untouched during weight optimization and residual bias calibration to let the W4A4 kernel quantize them on the fly.",
-    )
-    parser.add_argument(
-        "--nvfp4",
-        action="store_true",
-        help="Use NVFP4 (FP4 E2M1) block quantization. Requires Blackwell GPU (SM >= 10.0/12.0) for inference.",
-    )
-    parser.add_argument(
-        "--mxfp8",
-        action="store_true",
-        help="Use MXFP8 (Microscaling FP8) block quantization. Requires Blackwell GPU (SM >= 10.0) for inference.",
-    )
-    parser.add_argument(
-        "--w4a8-int8",
-        "--w4a8_int8",
-        "--w4a8",
-        action="store_true",
-        dest="w4a8_int8",
-        help="Use W4A8 INT8 grouped quantization format (AsymW4A8Int8Layout).",
-    )
-    parser.add_argument(
-        "--make-hybrid-mxfp8",
-        "--make_hybrid_mxfp8",
-        action="store_true",
-        dest="make_hybrid_mxfp8",
-        help="Convert an existing MXFP8 model to Hybrid MXFP8 (adds tensorwise fallback for Ada GPUs).",
-    )
-    parser.add_argument(
-        "--tensor-scales",
-        "--tensor_scales",
-        type=str,
-        default=None,
-        dest="tensor_scales_path",
-        help="Path to tensorwise FP8 model to steal scales from (for --make-hybrid-mxfp8).",
-    )
-    parser.add_argument(
-        "--fallback",
-        type=str,
-        default=None,
-        choices=["fp8", "int8", "mxfp8", "nvfp4", "w4a8_int8"],
-        help="Fallback quantization type for excluded layers (instead of keeping original precision).",
-    )
-    parser.add_argument(
-        "--custom-layers",
-        "--custom_layers",
-        type=str,
-        default=None,
-        dest="custom_layers",
-        help="Regex pattern for layers to quantize with custom type. Takes priority over exclusions.",
-    )
-    parser.add_argument(
-        "--exclude-layers",
-        "--exclude_layers",
-        type=str,
-        default=None,
-        dest="exclude_layers",
-        help="Regex pattern for layers to exclude from quantization (keep original precision or use fallback).",
-    )
-    parser.add_argument(
-        "--custom-type",
-        "--custom_type",
-        type=str,
-        default=None,
-        dest="custom_type",
-        choices=["fp8", "int8", "mxfp8", "nvfp4", "w4a8_int8"],
-        help="Quantization type for custom layer matches.",
-    )
-    # Custom-type parameter overrides
-    parser.add_argument(
-        "--custom-block-size",
-        "--custom_block_size",
-        type=int,
-        default=None,
-        dest="custom_block_size",
-        help="Block size for custom-type layers (default: inherit --block_size)",
-    )
-    parser.add_argument(
-        "--custom-scaling-mode",
-        "--custom_scaling_mode",
-        type=str,
-        default=None,
-        dest="custom_scaling_mode",
-        choices=["tensor", "row", "block", "block3d", "block2d"],
-        help="FP8 scaling mode for custom-type layers (default: inherit --scaling_mode). 'block2d' is deprecated alias for 'block'.",
-    )
-    parser.add_argument(
-        "--custom-simple",
-        "--custom_simple",
-        action="store_true",
-        dest="custom_simple",
-        help="Use simple quantization for custom-type layers",
-    )
-    parser.add_argument(
-        "--custom-heur",
-        "--custom_heur",
-        action="store_true",
-        dest="custom_heur",
-        help="Apply performance heuristics to custom-type layers",
-    )
-    parser.add_argument(
-        "--custom-full-precision-mm",
-        "--custom-fpmm",
-        action="store_true",
-        dest="custom_full_precision_mm",
-        help="Enable full_precision_matrix_mult=True in .comfy_quant metadata specifically for custom layers.",
-    )
-    parser.add_argument(
-        "--custom-convrot",
-        action="store_true",
-        dest="custom_convrot",
-        help="Enable group-wise Hadamard rotation (ConvRot) specifically for custom layers.",
-    )
-    parser.add_argument(
-        "--custom-convrot-group-size",
-        type=int,
-        default=256,
-        dest="custom_convrot_group_size",
-        help="Group size for custom layer ConvRot (must be power of 4). Default: 256",
-    )
-    # Fallback-type parameter overrides
-    parser.add_argument(
-        "--fallback-block-size",
-        "--fallback_block_size",
-        type=int,
-        default=None,
-        dest="fallback_block_size",
-        help="Block size for fallback-type layers (default: inherit --block_size)",
-    )
-    parser.add_argument(
-        "--fallback-simple",
-        "--fallback_simple",
-        action="store_true",
-        dest="fallback_simple",
-        help="Use simple quantization for fallback-type layers",
-    )
-    parser.add_argument(
-        "--simple", action="store_true", help="Skip SVD optimization, use simple quantization."
-    )
-    parser.add_argument(
-        "--full_precision_matrix_mult",
-        "--full-precision-matrix-mult",
-        "-fpmm",
-        action="store_true",
-        dest="full_precision_matrix_mult",
-        help="Add full_precision_matrix_mult=True to .comfy_quant metadata.",
-    )
-    parser.add_argument(
-        "--heur",
-        action="store_true",
-        help="Skip layers with poor quantization characteristics (aspect ratio, size).",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device to use for quantization (e.g., 'cpu', 'cuda', 'cuda:0'). Overrides auto-detection. Recommended with --simple for FP8/INT8.",
-    )
-    parser.add_argument(
-        "--devices",
-        type=str,
-        default=None,
-        help="Comma- or space-separated list of devices for multi-GPU parallel layer quantization (e.g., 'cuda:0,cuda:1' or '0,1').",
-    )
-    parser.add_argument(
-        "--num_gpus",
-        "--num-gpus",
-        type=int,
-        default=None,
-        dest="num_gpus",
-        help="Number of GPUs to use for parallel layer quantization (e.g. 2 for cuda:0, cuda:1).",
-    )
-    parser.add_argument(
-        "--input_scale",
-        "--input-scale",
-        action="store_true",
-        dest="input_scale",
-        help="Include input_scale tensor (fp32, 1.0) for quantized layers. Works with oconvert-fp8-scaled and --convert-int8-scaled. Always enabled for T5XXL.",
-    )
-    parser.add_argument(
-        "--verbose",
-        type=str,
-        default="NORMAL",
-        choices=["DEBUG", "VERBOSE", "NORMAL", "MINIMAL"],
-        help="Set verbosity: NORMAL (default), VERBOSE (increased), MINIMAL (reduced), DEBUG (all).",
-    )
-    # Model filter flags - generated from MODEL_FILTERS registry
+    parser.add_argument("-i", "--input", type=str, required=True, help="Input safetensors file path.")
+    parser.add_argument("-o", "--output", type=str, help="Output safetensors file path. Auto-generated if not provided.")
+    parser.add_argument("--resume", action="store_true", help="Resume quantization from existing sidecar progress file if present.")
+    parser.add_argument("--sidecar-path", "--sidecar_path", type=str, default=None, dest="sidecar_path", help="Custom path for the sidecar progress JSON file.")
+    parser.add_argument("--max-shard-size", "--max_shard_size", type=str, default=None, dest="max_shard_size", help="Maximum size per output safetensors shard (e.g. '5GB').")
+    parser.add_argument("--no-checkpoint", "--no_checkpoint", action="store_true", dest="no_checkpoint", help="Disable sidecar progress tracking and per-layer checkpoint saving.")
+    parser.add_argument("--comfy_quant", "--comfy-quant", action="store_true", default=True, dest="comfy_quant", help="Use Comfy quantization format (enabled by default).")
+    parser.add_argument("-4", "--int4", "--w4a4", action="store_true", default=True, dest="int4", help="Use INT4 W4A4 ConvRot quantization (default).")
+    parser.add_argument("--convrot", action="store_true", default=True, help="Enable group-wise Hadamard rotation (ConvRot) for INT4 row-wise quantization.")
+    parser.add_argument("--convrot-group-size", "--convrot_group_size", type=int, default=256, dest="convrot_group_size", help="Group size for ConvRot (default: 256).")
+    parser.add_argument("--dynamic-convrot", "--dynamic_convrot", action="store_true", dest="dynamic_convrot", help="Enable dynamic ConvRot group sizing.")
+    parser.add_argument("--w4a4-untouched-activations", "--w4a4_untouched_activations", action="store_true", dest="w4a4_untouched_activations", help="Leave calibration activations untouched during weight optimization.")
+    parser.add_argument("--custom-layers", "--custom_layers", type=str, default=None, dest="custom_layers", help="Regex pattern for layers to quantize with custom options.")
+    parser.add_argument("--exclude-layers", "--exclude_layers", type=str, default=None, dest="exclude_layers", help="Regex pattern for layers to exclude from quantization.")
+    parser.add_argument("--custom-block-size", "--custom_block_size", type=int, default=None, dest="custom_block_size", help="Block size for custom layers.")
+    parser.add_argument("--custom-simple", "--custom_simple", action="store_true", dest="custom_simple", help="Use simple quantization for custom layers.")
+    parser.add_argument("--custom-heur", "--custom_heur", action="store_true", dest="custom_heur", help="Apply performance heuristics to custom layers.")
+    parser.add_argument("--custom-full-precision-mm", "--custom-fpmm", action="store_true", dest="custom_full_precision_mm", help="Enable full_precision_matrix_mult=True in .comfy_quant metadata for custom layers.")
+    parser.add_argument("--custom-convrot", action="store_true", dest="custom_convrot", help="Enable group-wise Hadamard rotation for custom layers.")
+    parser.add_argument("--custom-convrot-group-size", type=int, default=256, dest="custom_convrot_group_size", help="Group size for custom layer ConvRot (default: 256).")
+    parser.add_argument("--simple", action="store_true", help="Skip SVD optimization, use simple quantization.")
+    parser.add_argument("--full_precision_matrix_mult", "--full-precision-matrix-mult", "-fpmm", action="store_true", dest="full_precision_matrix_mult", help="Add full_precision_matrix_mult=True to .comfy_quant metadata.")
+    parser.add_argument("--heur", action="store_true", help="Skip layers with poor quantization characteristics.")
+    parser.add_argument("--device", type=str, default=None, help="Device to use for quantization (e.g., 'cpu', 'cuda').")
+    parser.add_argument("--devices", type=str, default=None, help="Comma-separated list of devices for multi-GPU parallel quantization.")
+    parser.add_argument("--num_gpus", "--num-gpus", type=int, default=None, dest="num_gpus", help="Number of GPUs to use.")
+    parser.add_argument("--verbose", type=str, default="NORMAL", choices=["DEBUG", "VERBOSE", "NORMAL", "MINIMAL"], help="Set verbosity.")
 
     for filter_name, filter_cfg in MODEL_FILTERS.items():
-        parser.add_argument(
-            f"--{filter_name}",
-            action="store_true",
-            help=filter_cfg.get("help", f"Apply {filter_name} model exclusions"),
-        )
-    parser.add_argument(
-        "--full_matrix",
-        "--full-matrix",
-        action="store_true",
-        dest="full_matrix",
-        help="If should use torch.linalg.svd with full matices instead of the torch.svd_lowrank.",
-    )
-    parser.add_argument(
-        "--scaling_mode",
-        "--scaling-mode",
-        type=str,
-        default="tensor",
-        dest="scaling_mode",
-        choices=["tensor", "row", "block", "block3d", "block2d"],
-        help="FP8 scaling mode: 'tensor' (1 global scale), 'row' (per-row scale), 'block' (2D tiles like INT8), 'block3d' (per-row-group 3D, legacy). 'block2d' is deprecated alias for 'block'.",
-    )
+        parser.add_argument(f"--{filter_name}", action="store_true", help=filter_cfg.get("help", f"Apply {filter_name} model exclusions"))
 
-    parser.add_argument(
-        "--block_size",
-        "--block-size",
-        "--group_size",
-        "--group-size",
-        type=int,
-        default=None,
-        dest="block_size",
-        help="Block/group size for block-wise quantization. Defaults to 128 when using block scaling mode. Common values: 64, 128.",
-    )
-    parser.add_argument(
-        "--calib_samples",
-        "--calib-samples",
-        type=int,
-        default=3072,
-        dest="calib_samples",
-        help="Number of random samples for bias correction.",
-    )
-    parser.add_argument(
-        "--calib_cpu",
-        "--calib-cpu",
-        action="store_true",
-        dest="calib_cpu",
-        help="Store calibration data cache on CPU instead of disk (when using --low-memory). Always True if --low-memory is not used.",
-    )
-    parser.add_argument(
-        "--manual_seed",
-        "--manual-seed",
-        type=int,
-        default=-1,
-        dest="manual_seed",
-        help="Set a manual seed for reproducibility. Use -1 for random.",
-    )
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        default="prodigy",
-        choices=["original", "adamw", "radam", "prodigy"],
-        help="Optimization algorithm.",
-    )
-    parser.add_argument(
-        "--num_iter",
-        "--num-iter",
-        type=int,
-        default=4000,
-        dest="num_iter",
-        help="Total optimization iterations per tensor.",
-    )
-    parser.add_argument(
-        "--lr", type=float, default=1.0, help="[AdamW/RAdam/Original] Initial learning rate."
-    )
-    parser.add_argument(
-        "--use_speed",
-        "--use-speed",
-        action="store_true",
-        dest="use_speed",
-        help="[Prodigy] Enabled the use_speed parameter for Prodigy optimizer.",
-    )
-    parser.add_argument(
-        "--lr_schedule",
-        "--lr-schedule",
-        type=str,
-        default="plateau",
-        dest="lr_schedule",
-        choices=["adaptive", "exponential", "plateau"],
-        help="LR schedule for optimizer: 'adaptive' (special custom), 'exponential' (gamma decay), 'plateau' (reduce on stall)",
-    )
-    parser.add_argument(
-        "--lr_gamma",
-        "--lr-gamma",
-        type=float,
-        default=0.99,
-        dest="lr_gamma",
-        help="[exponential] Decay factor per step (default: 0.99)",
-    )
-    parser.add_argument(
-        "--lr_patience",
-        "--lr-patience",
-        type=int,
-        default=1,
-        dest="lr_patience",
-        help="[plateau] Steps before decay",
-    )
-    parser.add_argument(
-        "--lr_factor",
-        "--lr-factor",
-        type=float,
-        default=0.95,
-        dest="lr_factor",
-        help="[plateau, adaptive] LR reduction factor",
-    )
-    parser.add_argument(
-        "--lr_min",
-        "--lr-min",
-        type=float,
-        default=1e-8,
-        dest="lr_min",
-        help="[plateau] Minimum LR bound",
-    )
-    parser.add_argument(
-        "--lr_cooldown",
-        "--lr-cooldown",
-        type=int,
-        default=0,
-        dest="lr_cooldown",
-        help="[plateau, adaptive] Steps to wait after reduction(plateau, adaptive) or improvement(adaptive) before resuming normal operation",
-    )
-    parser.add_argument(
-        "--lr_threshold",
-        "--lr-threshold",
-        type=float,
-        default=0.0,
-        dest="lr_threshold",
-        help="[plateau] Min improvement to reset patience",
-    )
-    parser.add_argument(
-        "--lr_adaptive_mode",
-        "--lr-adaptive-mode",
-        type=str,
-        default="simple-reset",
-        dest="lr_adaptive_mode",
-        choices=["simple-reset", "no-reset"],
-        help="[adaptive] Counter reset behavior (see MANUAL.md)",
-    )
-    parser.add_argument(
-        "--lr-threshold-mode",
-        "--lr_threshold_mode",
-        type=str,
-        default="rel",
-        choices=["rel", "abs"],
-        dest="lr_threshold_mode",
-        help="[plateau] How to interpret --lr_threshold: 'rel' (relative to best loss) or 'abs' (absolute). (default: rel)",
-    )
-    parser.add_argument(
-        "--lr-shape-influence",
-        "--lr_shape_influence",
-        type=float,
-        default=1.0,
-        dest="lr_shape_influence",
-        help="[plateau] Scale factor based on tensor aspect ratio. 0.0=disabled, 1.0=full effect. Elongated tensors get more aggressive decay. (default: 1.0)",
-    )
-    # Early stopping thresholds (--help-advanced)
-    parser.add_argument(
-        "--early-stop-loss",
-        "--early_stop_loss",
-        "-esloss",
-        type=float,
-        default=5e-9,
-        dest="early_stop_loss",
-        help="Early stop when loss drops below this value. (default: 1e-8)",
-    )
-    parser.add_argument(
-        "--early-stop-lr",
-        "--early_stop_lr",
-        "-eslr",
-        type=float,
-        default=1.01e-8,
-        dest="early_stop_lr",
-        help="Early stop when LR drops below this value. (default: 1e-10)",
-    )
-    parser.add_argument(
-        "--early-stop-stall",
-        "--early_stop_stall",
-        "-esstall",
-        type=int,
-        default=2000,
-        dest="early_stop_stall",
-        help="Early stop when worse_loss_counter exceeds this. (default: 1000)",
-    )
-    # NVFP4 scale optimization (--help-advanced)
-    parser.add_argument(
-        "--scale-refinement",
-        "--scale_refinement",
-        type=int,
-        default=1,
-        dest="scale_refinement_rounds",
-        help="[NVFP4] Number of scale refinement rounds for 'iterative' mode (default: 1)",
-    )
-    parser.add_argument(
-        "--scale-optimization",
-        "--scale_optimization",
-        type=str,
-        default="fixed",
-        dest="scale_optimization",
-        choices=["fixed", "iterative", "joint", "dualround"],
-        help="Scale optimization mode: 'fixed' (default), 'iterative', 'joint', 'dualround' (dual-pass AdaRound for INT8)",
-    )
-    parser.add_argument(
-        "--top_p",
-        "--top-p",
-        type=float,
-        default=0.2,
-        dest="top_p",
-        help="Proportion of principal components (SVD) to use.",
-    )
-    parser.add_argument(
-        "--min_k",
-        "--min-k",
-        type=int,
-        default=256,
-        dest="min_k",
-        help="Minimum number of principal components.",
-    )
-    parser.add_argument(
-        "--max_k",
-        "--max-k",
-        type=int,
-        default=1280,
-        dest="max_k",
-        help="Maximum number of principal components.",
-    )
-
-    # LoRA extraction options (--help-lora)
-    parser.add_argument(
-        "--extract-lora",
-        "--extract_lora",
-        action="store_true",
-        dest="extract_lora",
-        help="Extract quantization error into separate LoRA adapter layers.",
-    )
-    parser.add_argument(
-        "--lora-rank",
-        "--lora_rank",
-        type=int,
-        default=32,
-        dest="lora_rank",
-        help="Rank for extracted LoRA layers (default: 32).",
-    )
-    parser.add_argument(
-        "--lora-target",
-        "--lora_target",
-        type=str,
-        default=None,
-        dest="lora_target",
-        help="Regex pattern for layers to target for LoRA extraction (e.g., 'attn.qkv').",
-    )
-    parser.add_argument(
-        "--lora-depth",
-        "--lora_depth",
-        type=int,
-        default=1,
-        dest="lora_depth",
-        help="Maximum block depth for LoRA extraction. Targets only block index < depth. (default: 1).",
-    )
-    parser.add_argument(
-        "--lora-ar-threshold",
-        "--lora_ar_threshold",
-        type=float,
-        default=0.0,
-        dest="lora_ar_threshold",
-        help="Aspect ratio threshold for LoRA extraction. Only layers with AR < threshold are targeted (targeting square layers). 0.0 for all layers (default: 0.0).",
-    )
-    parser.add_argument(
-        "--lora-output",
-        "--lora_output",
-        type=str,
-        default=None,
-        dest="lora_output",
-        help="Path to save extracted LoRA adapter (.safetensors). Auto-generated if not provided.",
-    )
-
-    # Model dequantization mode
-    parser.add_argument(
-        "--dequantize",
-        "--dequantize-to-bf16",
-        "--dequantize_to_bf16",
-        "--dequantize-bf16",
-        "--dequantize_bf16",
-        action="store_true",
-        dest="dequantize",
-        help="Dequantize a quantized safetensors model back to high precision (bfloat16 by default, or as specified by --dequant-dtype)",
-    )
-    parser.add_argument(
-        "--dequant-dtype",
-        "--dequant_dtype",
-        type=str,
-        default="bf16",
-        choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"],
-        dest="dequant_dtype",
-        help="Target precision dtype for model dequantization (default: bf16).",
-    )
-
-    # FP8 scaled to comfy_quant conversion mode
-    parser.add_argument(
-        "--convert-fp8-scaled",
-        "--convert_fp8_scaled",
-        action="store_true",
-        dest="convert_fp8_scaled",
-        help="Convert fp8_scaled model to comfy_quant format (no quantization, just format conversion)",
-    )
-    parser.add_argument(
-        "--hp-filter",
-        "--hp_filter",
-        type=str,
-        default=None,
-        dest="hp_filter",
-        help="Regex pattern for high-precision layers to validate (error if they have FP8 weights)",
-    )
-    parser.add_argument(
-        "--full-precision-mm",
-        "--full_precision_mm",
-        action="store_true",
-        dest="full_precision_mm",
-        help="Set full_precision_matrix_mult=True in .comfy_quant metadata (for --convert-fp8-scaled)",
-    )
-
-    # INT8 to comfy_quant conversion mode
-    parser.add_argument(
-        "--convert-int8-scaled",
-        "--convert_int8_scaled",
-        action="store_true",
-        dest="convert_int8_scaled",
-        help="Convert legacy INT8 model (.scale_weight) to comfy_quant format (.weight_scale + metadata)",
-    )
-    parser.add_argument(
-        "--replace-quant-metadata",
-        "--replace_quant_metadata",
-        action="store_true",
-        dest="replace_quant_metadata",
-        help="Scan quantized model, auto-detect layer quantization formats, and replace header and layer metadata with ComfyQuant metadata.",
-    )
-
-    # Legacy input scale addition mode
-    parser.add_argument(
-        "--legacy_input_add",
-        "--legacy-input-add",
-        action="store_true",
-        dest="legacy_input_add",
-        help="Add .scale_input tensors to legacy fp8_scaled models (keeps legacy format, adds missing input scales)",
-    )
-
-    # Legacy FP8 cleanup mode
-    parser.add_argument(
-        "--cleanup-fp8-scaled",
-        "--cleanup_fp8_scaled",
-        action="store_true",
-        dest="cleanup_fp8_scaled",
-        help="Clean up legacy fp8_scaled model: remove orphaned scales, set scaled_fp8 marker, normalize scales",
-    )
-    parser.add_argument(
-        "--scaled-fp8-marker",
-        "--scaled_fp8_marker",
-        type=int,
-        default=0,
-        choices=[0, 2],
-        dest="scaled_fp8_marker",
-        help="Size for scaled_fp8 marker tensor: 0=empty((0)), 2=empty((2)). (default: 0)",
-    )
-
-    # Activation scale calibration mode
-    parser.add_argument(
-        "--actcal",
-        action="store_true",
-        dest="actcal",
-        help="Calibrate input_scale values using simulated PTQ. Patches existing FP8 model with computed scales.",
-    )
-    parser.add_argument(
-        "--actcal-samples",
-        "--actcal_samples",
-        type=int,
-        default=64,
-        dest="actcal_samples",
-        help="Number of calibration samples for --actcal (default: 64)",
-    )
-    parser.add_argument(
-        "--actcal-percentile",
-        "--actcal_percentile",
-        type=float,
-        default=99.9,
-        dest="actcal_percentile",
-        help="Percentile for absmax in calibration (default: 99.9, use 100 for true max)",
-    )
-    parser.add_argument(
-        "--actcal-lora",
-        "--actcal_lora",
-        dest="actcal_lora",
-        help="LoRA file for informed calibration (uses LoRA_A as input directions)",
-    )
-    parser.add_argument(
-        "--actcal-seed",
-        "--actcal_seed",
-        type=int,
-        default=42,
-        dest="actcal_seed",
-        help="Random seed for calibration (default: 42). Use for reproducible results.",
-    )
-    parser.add_argument(
-        "--actcal-device",
-        "--actcal_device",
-        type=str,
-        default=None,
-        dest="actcal_device",
-        help="Device for calibration: 'cpu', 'cuda', 'cuda:0', etc. (default: auto-detect CUDA)",
-    )
-
-    # Metadata saving option
-    parser.add_argument(
-        "--save-quant-metadata",
-        "--save_quant_metadata",
-        action="store_true",
-        dest="save_quant_metadata",
-        help="Save quantization metadata in safetensors header (under _quantization_metadata key)",
-    )
-
-    # Scale normalization toggle (for testing)
-    parser.add_argument(
-        "--no-normalize-scales",
-        "--no_normalize_scales",
-        action="store_true",
-        dest="no_normalize_scales",
-        help="Disable normalization of 1-element scale arrays to scalars (for testing/compatibility)",
-    )
-
-    # NVFP4 input scales (from calibration or another NVFP4 model)
-    parser.add_argument(
-        "--input-scales",
-        "--input_scales",
-        type=str,
-        default=None,
-        dest="input_scales_path",
-        help="Path to input scales file (.json or .safetensors). JSON format: {'layer.name': 0.015, ...}. Safetensors: extracts .input_scale tensors from an existing NVFP4 model.",
-    )
-
-    # ComfyQuant layer config editing mode
-    parser.add_argument(
-        "--edit-quant",
-        "--edit_quant",
-        action="store_true",
-        dest="edit_quant",
-        help="Edit .comfy_quant tensors and _quantization_metadata header (add/remove keys)",
-    )
-    parser.add_argument(
-        "--remove-keys",
-        "--remove_keys",
-        type=str,
-        default=None,
-        dest="remove_keys",
-        help="Comma-separated keys to remove (e.g., 'full_precision_matrix_mult,group_size')",
-    )
-    parser.add_argument(
-        "--add-keys",
-        "--add_keys",
-        type=str,
-        default=None,
-        dest="add_keys",
-        help="Python-like key:value pairs to add or update (e.g., \"'full_precision_matrix_mult': true, 'group_size': 64\")",
-    )
-    parser.add_argument(
-        "--quant-filter",
-        "--quant_filter",
-        type=str,
-        default=None,
-        dest="quant_filter",
-        help="Regex pattern to filter which layers to edit (default: all layers)",
-    )
-
-    # Per-layer quantization config (JSON file)
-    parser.add_argument(
-        "--layer-config",
-        "--layer_config",
-        type=str,
-        default=None,
-        dest="layer_config",
-        help="""Path to JSON file with per-layer quantization settings (regex patterns).
-Example config:
-{
-  "_default": {"format": "float8_e4m3fn"},
-  "attn": {"format": "float8_e4m3fn", "full_precision_matrix_mult": true},
-  "\\\\.0\\\\.img_mod": {"skip": true}
-}
-By default, patterns use re.search (substring match). Use --fullmatch for full string matching.
-In JSON, backslashes must be doubled (\\\\. for literal dot). See DEVELOPMENT.md for details.""",
-    )
-    parser.add_argument(
-        "--fullmatch",
-        action="store_true",
-        dest="layer_config_fullmatch",
-        help="Use re.fullmatch instead of re.search for --layer-config patterns. With fullmatch, patterns must match the entire layer name (use .* for wildcards).",
-    )
-
-    # Dry run / template generation
-    parser.add_argument(
-        "--dry-run",
-        "--dry_run",
-        type=str,
-        nargs="?",
-        const="analyze",
-        default=None,
-        dest="dry_run",
-        choices=["analyze", "create-template"],
-        help="Dry run mode: 'analyze' shows what would be processed, 'create-template' generates config template",
-    )
-
-    # Verbose output for pinned memory transfers
-    parser.add_argument(
-        "--verbose-pinned",
-        "--verbose_pinned",
-        action="store_true",
-        dest="verbose_pinned",
-        help="Print per-tensor pinned memory transfer details",
-    )
-
-    # Memory-efficient loading mode
-    parser.add_argument(
-        "--low-memory",
-        "--low_memory",
-        "-lm",
-        action="store_true",
-        dest="low_memory",
-        help="Use streaming tensor loading to reduce RAM usage (recommended for models >50%% of available RAM)",
-    )
+    parser.add_argument("--full_matrix", "--full-matrix", action="store_true", dest="full_matrix", help="Use full matrices for SVD.")
+    parser.add_argument("--scaling_mode", "--scaling-mode", type=str, default="row", dest="scaling_mode", choices=["row", "block"], help="Quantization scaling mode (default: row).")
+    parser.add_argument("--block_size", "--block-size", "--group_size", "--group-size", type=int, default=64, dest="block_size", help="Block/group size (default: 64).")
+    parser.add_argument("--calib_samples", "--calib-samples", type=int, default=3072, dest="calib_samples", help="Number of random samples for calibration.")
+    parser.add_argument("--calib_cpu", "--calib-cpu", action="store_true", dest="calib_cpu", help="Store calibration data cache on CPU.")
+    parser.add_argument("--manual_seed", "--manual-seed", type=int, default=-1, dest="manual_seed", help="Manual seed for reproducibility.")
+    parser.add_argument("--optimizer", type=str, default="prodigy", choices=["original", "adamw", "radam", "prodigy"], help="Optimization algorithm.")
+    parser.add_argument("--num_iter", "--num-iter", type=int, default=4000, dest="num_iter", help="Total optimization iterations per tensor.")
+    parser.add_argument("--lr", type=float, default=1.0, help="Initial learning rate.")
+    parser.add_argument("--use_speed", "--use-speed", action="store_true", dest="use_speed", help="Enable use_speed parameter for Prodigy optimizer.")
+    parser.add_argument("--lr_schedule", "--lr-schedule", type=str, default="plateau", dest="lr_schedule", choices=["adaptive", "exponential", "plateau"], help="LR schedule.")
+    parser.add_argument("--lr_gamma", "--lr-gamma", type=float, default=0.99, dest="lr_gamma", help="Decay factor per step for exponential schedule.")
+    parser.add_argument("--lr_patience", "--lr-patience", type=int, default=1, dest="lr_patience", help="Steps before decay for plateau schedule.")
+    parser.add_argument("--lr_factor", "--lr-factor", type=float, default=0.95, dest="lr_factor", help="LR reduction factor.")
+    parser.add_argument("--lr_min", "--lr-min", type=float, default=1e-8, dest="lr_min", help="Minimum LR bound.")
+    parser.add_argument("--lr_cooldown", "--lr-cooldown", type=int, default=0, dest="lr_cooldown", help="Cooldown steps after LR reduction.")
+    parser.add_argument("--lr_threshold", "--lr-threshold", type=float, default=0.0, dest="lr_threshold", help="Min improvement to reset patience.")
+    parser.add_argument("--lr_adaptive_mode", "--lr-adaptive-mode", type=str, default="simple-reset", dest="lr_adaptive_mode", choices=["simple-reset", "no-reset"], help="Counter reset behavior.")
+    parser.add_argument("--lr-threshold-mode", "--lr_threshold_mode", type=str, default="rel", choices=["rel", "abs"], dest="lr_threshold_mode", help="Threshold interpretation mode.")
+    parser.add_argument("--lr-shape-influence", "--lr_shape_influence", type=float, default=1.0, dest="lr_shape_influence", help="Scale factor based on tensor aspect ratio.")
+    parser.add_argument("--early-stop-loss", "--early_stop_loss", "-esloss", type=float, default=5e-9, dest="early_stop_loss", help="Early stop loss threshold.")
+    parser.add_argument("--early-stop-lr", "--early_stop_lr", "-eslr", type=float, default=1.01e-8, dest="early_stop_lr", help="Early stop LR threshold.")
+    parser.add_argument("--early-stop-stall", "--early_stop_stall", "-esstall", type=int, default=2000, dest="early_stop_stall", help="Early stop stall count threshold.")
+    parser.add_argument("--scale-optimization", "--scale_optimization", type=str, default="fixed", dest="scale_optimization", choices=["fixed", "iterative", "joint", "dualround"], help="Scale optimization mode.")
+    parser.add_argument("--top_p", "--top-p", type=float, default=0.2, dest="top_p", help="Proportion of principal components to use.")
+    parser.add_argument("--min_k", "--min-k", type=int, default=256, dest="min_k", help="Minimum number of principal components.")
+    parser.add_argument("--max_k", "--max-k", type=int, default=1280, dest="max_k", help="Maximum number of principal components.")
+    parser.add_argument("--extract-lora", "--extract_lora", action="store_true", dest="extract_lora", help="Extract quantization error into separate LoRA adapter layers.")
+    parser.add_argument("--lora-rank", "--lora_rank", type=int, default=32, dest="lora_rank", help="Rank for extracted LoRA layers.")
+    parser.add_argument("--lora-target", "--lora_target", type=str, default=None, dest="lora_target", help="Regex pattern for LoRA target layers.")
+    parser.add_argument("--lora-depth", "--lora_depth", type=int, default=1, dest="lora_depth", help="Maximum block depth for LoRA extraction.")
+    parser.add_argument("--lora-ar-threshold", "--lora_ar_threshold", type=float, default=0.0, dest="lora_ar_threshold", help="Aspect ratio threshold for LoRA extraction.")
+    parser.add_argument("--lora-output", "--lora_output", type=str, default=None, dest="lora_output", help="Path to save extracted LoRA adapter.")
+    parser.add_argument("--convert-int4", "--convert-int4-to-comfy-quant", action="store_true", dest="convert_int4", help="Convert INT4 model to comfy_quant format.")
+    parser.add_argument("--layer_config", "--layer-config", type=str, default=None, dest="layer_config", help="Path to layer configuration JSON file.")
+    parser.add_argument("--layer_config_fullmatch", "--layer-config-fullmatch", action="store_true", dest="layer_config_fullmatch", help="Use full matching for layer config regex.")
+    parser.add_argument("--save_quant_metadata", "--save-quant-metadata", action="store_true", default=True, dest="save_quant_metadata", help="Save quantization metadata in header.")
+    parser.add_argument("--low-memory", "--low_memory", action="store_true", dest="low_memory", help="Use memory-efficient loading.")
+    parser.add_argument("--dry-run", "--dry_run", action="store_true", dest="dry_run", help="Report layer routing plan without converting.")
+    parser.add_argument("--actcal_lora", "--actcal-lora", type=str, default=None, dest="actcal_lora", help="Path to LoRA file for calibration.")
 
     return parser
 
 
-def run_conversion(args):
-    """Run the conversion process with the provided arguments."""
-    # Apply default block_size=128 when block scaling mode is active and no explicit value given
-    if args.block_size is None:
-        needs_block = (
-            (args.int8 and getattr(args, "scaling_mode", "tensor") != "tensor")
-            or getattr(args, "scaling_mode", "tensor") in ("block", "block2d", "block3d")
-            or args.custom_type == "int8"
-            or args.fallback == "int8"
-        )
-        if needs_block:
-            args.block_size = 128
-
-    # Apply default block_size=128 for custom/fallback INT8 if not set
-    if (
-        args.custom_type == "int8"
-        and args.custom_scaling_mode != "tensor"
-        and args.custom_block_size is None
-    ):
-        args.custom_block_size = args.block_size if args.block_size else 128
-    if args.fallback == "int8" and args.fallback_block_size is None:
-        args.fallback_block_size = args.block_size if args.block_size else 128
-
-    # Initialize logging framework with user's verbosity preference
+def run_conversion(args) -> None:
+    """Execute conversion based on parsed arguments."""
     setup_logging(args.verbose)
+    if hasattr(args, "verbose"):
+        set_pinned_verbose(args.verbose in ("VERBOSE", "DEBUG"))
 
-    # Parse target device list for single or multi-GPU execution
-    target_devices = parse_devices(
-        device=getattr(args, "device", None),
-        devices=getattr(args, "devices", None),
-        num_gpus=getattr(args, "num_gpus", None),
-    )
-
-    # Set global scale normalization flag from CLI
-    global NORMALIZE_SCALES_ENABLED
-    NORMALIZE_SCALES_ENABLED = not args.no_normalize_scales
-
-    # Set pinned memory verbosity
-    set_pinned_verbose(args.verbose_pinned)
-
-    actcal_scales = None
-
-    # Dry-run modes are separate workflows and must return before any conversion.
-    if args.dry_run == "analyze":
+    if args.dry_run:
         analyze_dry_run(args)
         return
 
-    if args.dry_run == "create-template":
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        template_path = args.output or (
-            os.path.splitext(args.input)[0] + "_layer_config_template.json"
-        )
-        template_directory = os.path.dirname(template_path)
-        if template_directory:
-            os.makedirs(template_directory, exist_ok=True)
-        generate_config_template(args.input, template_path, block_size=args.block_size or 128)
-        return
-
-    # Handle model dequantization mode (separate workflow)
-    if args.dequantize:
-        if not args.output:
+    if getattr(args, "convert_int4", False):
+        output_file = args.output
+        if not output_file:
             base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_dequantized_{args.dequant_dtype}.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        dequantize_model(
+            output_file = f"{base}_comfy_quant.safetensors"
+        convert_int4_to_comfy_quant(
             args.input,
-            args.output,
-            dtype=args.dequant_dtype,
-            low_memory=args.low_memory,
-        )
-        return
-
-    # Handle fp8_scaled conversion mode first (separate workflow)
-    if args.convert_fp8_scaled:
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_fp8mixed.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        convert_fp8_scaled_to_comfy_quant(
-            args.input,
-            args.output,
-            hp_filter=args.hp_filter,
-            full_precision_mm=args.full_precision_mm,
-            include_input_scale=args.input_scale,
-        )
-        return
-
-    # Handle int8 to comfy_quant conversion mode (separate workflow)
-    if args.convert_int8_scaled:
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_int8_comfy.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        # Use block_size from args or default to 128
-        int8_block_size = args.block_size if args.block_size else 128
-
-        convert_int8_to_comfy_quant(
-            args.input,
-            args.output,
-            block_size=int8_block_size,
-            include_input_scale=args.input_scale,
+            output_file,
+            block_size=args.block_size or 64,
+            convrot_group_size=args.convrot_group_size or 256,
             save_quant_metadata=args.save_quant_metadata,
         )
         return
 
-    # Handle scan and replace metadata mode (separate workflow)
-    if args.replace_quant_metadata:
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_comfy_metadata.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        scan_and_replace_comfy_quant_metadata(
-            args.input,
-            args.output,
-            default_block_size=args.block_size,
-            full_precision_mm=args.full_precision_mm,
-            include_input_scale=args.input_scale,
-            int4=getattr(args, "int4", False),
-            convrot=getattr(args, "convrot", False),
-            convrot_group_size=getattr(args, "convrot_group_size", 256),
-        )
-        return
-
-    # Handle NVFP4 quantization mode (separate workflow OR unified if mixing formats)
-    if args.nvfp4:
-        # Check if we need mixed format support
-        needs_mixing = args.custom_type or args.fallback or args.layer_config
-
-        if needs_mixing:
-            # Route through unified path for mixed format support
-            print("NVFP4 with custom/fallback: using unified quantization path")
-            if not args.output:
-                base = os.path.splitext(args.input)[0]
-                args.output = f"{base}_nvfp4_mixed.safetensors"
-            # Fall through to convert_to_fp8_scaled with target_format="nvfp4"
-            args.int8 = False  # Ensure not INT8
-            # Continue to main FP8 path below with nvfp4 as target_format
-        else:
-            # Use dedicated NVFP4 path for simple cases
-            if not args.output:
-                base = os.path.splitext(args.input)[0]
-                # Build filename: {simple_|learned_}nvfp4[mixed]
-                prefix = "simple_" if args.simple else "learned_"
-                # Check for filters or custom-layers
-                filter_flags = extract_filter_flags(args)
-                has_filters = any(filter_flags.values())
-                has_custom = bool(args.custom_layers)
-                mixed_suffix = "mixed" if (has_filters or has_custom) else ""
-                args.output = f"{base}_{prefix}nvfp4{mixed_suffix}.safetensors"
-
-            if not os.path.exists(args.input):
-                print(f"Error: Input file not found: {args.input}")
-                return
-
-            if os.path.abspath(args.input) == os.path.abspath(args.output):
-                print("Error: Output file cannot be same as input.")
-                return
-
-            # Compute seed early (same logic as FP8)
-            seed = (
-                int(torch.randint(0, 2**32 - 1, ()).item())
-                if args.manual_seed == -1
-                else args.manual_seed
-            )
-            print(f"Using seed: {seed}")
-
-            # Extract filter flags with validation
-            filter_flags = extract_filter_flags(args)
-
-            # Load input scales if provided or calibrated
-            input_scales = None
-            if args.input_scales_path:
-                if not os.path.exists(args.input_scales_path):
-                    print(f"Error: Input scales file not found: {args.input_scales_path}")
-                    return
-                input_scales = load_input_scales(args.input_scales_path)
-                print(f"Loaded {len(input_scales)} input scales from: {args.input_scales_path}")
-            elif actcal_scales:
-                input_scales = actcal_scales
-
-            # Call convert_to_nvfp4 with explicit args (no **kwargs footgun)
-            convert_to_nvfp4(
-                args.input,
-                args.output,
-                # Filter flags
-                filter_flags=filter_flags,
-                exclude_layers=args.exclude_layers,
-                # Quantization options
-                simple=args.simple,
-                num_iter=args.num_iter,
-                heur=args.heur,
-                calib_samples=args.calib_samples,
-                seed=seed,
-                # Optimizer/LR options
-                optimizer=args.optimizer,
-                lr=args.lr,
-                lr_schedule=args.lr_schedule,
-                top_p=args.top_p,
-                min_k=args.min_k,
-                max_k=args.max_k,
-                full_matrix=args.full_matrix,
-                # LR schedule tuning
-                lr_gamma=args.lr_gamma,
-                lr_patience=args.lr_patience,
-                lr_factor=args.lr_factor,
-                lr_min=args.lr_min,
-                lr_cooldown=args.lr_cooldown,
-                lr_threshold=args.lr_threshold,
-                lr_adaptive_mode=args.lr_adaptive_mode,
-                lr_shape_influence=args.lr_shape_influence,
-                lr_threshold_mode=args.lr_threshold_mode,
-                # Early stopping
-                early_stop_loss=args.early_stop_loss,
-                early_stop_lr=args.early_stop_lr,
-                early_stop_stall=args.early_stop_stall,
-                # Scale optimization
-                scale_refinement_rounds=args.scale_refinement_rounds,
-                scale_optimization=args.scale_optimization,
-                # Input scales
-                input_scales=input_scales,
-                # Memory mode
-                low_memory=args.low_memory,
-                devices=target_devices,
-                # Prodigy specific
-                use_speed=args.use_speed,
-                # LoRA options
-                extract_lora=args.extract_lora,
-                lora_rank=args.lora_rank,
-                lora_target=args.lora_target,
-                lora_depth=args.lora_depth,
-                lora_ar_threshold=args.lora_ar_threshold,
-                lora_output=args.lora_output,
-                # Checkpointing options
-                resume=args.resume,
-                sidecar_path=args.sidecar_path,
-                max_shard_size=args.max_shard_size,
-                no_checkpoint=args.no_checkpoint,
-            )
-            return
-
-    # Handle Hybrid MXFP8 conversion mode (separate workflow)
-    if args.make_hybrid_mxfp8:
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_hybrid.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        convert_to_hybrid_mxfp8(args.input, args.output, tensor_scales_path=args.tensor_scales_path)
-        return
-
-    # Handle MXFP8 quantization mode (separate workflow OR unified if mixing formats)
-    if args.mxfp8:
-        # Check if we need mixed format support
-        needs_mixing = args.custom_type or args.fallback or args.layer_config
-
-        if needs_mixing:
-            # Route through unified path for mixed format support
-            print("MXFP8 with custom/fallback: using unified quantization path")
-            if not args.output:
-                base = os.path.splitext(args.input)[0]
-                args.output = f"{base}_mxfp8_mixed.safetensors"
-            # Fall through to convert_to_fp8_scaled with target_format="mxfp8"
-            args.int8 = False  # Ensure not INT8
-            # Continue to main FP8 path below with mxfp8 as target_format
-        else:
-            # Use dedicated MXFP8 path for simple cases
-            if not args.output:
-                base = os.path.splitext(args.input)[0]
-                # Build filename: {simple_|learned_}mxfp8[mixed]
-                prefix = "simple_" if args.simple else "learned_"
-                # Check for filters or custom-layers
-                filter_flags = extract_filter_flags(args)
-                has_filters = any(filter_flags.values())
-                has_custom = bool(args.custom_layers)
-                mixed_suffix = "mixed" if (has_filters or has_custom) else ""
-                args.output = f"{base}_{prefix}mxfp8{mixed_suffix}.safetensors"
-
-            if not os.path.exists(args.input):
-                print(f"Error: Input file not found: {args.input}")
-                return
-
-            if os.path.abspath(args.input) == os.path.abspath(args.output):
-                print("Error: Output file cannot be same as input.")
-                return
-
-            # Compute seed early (same logic as FP8/NVFP4)
-            seed = (
-                int(torch.randint(0, 2**32 - 1, ()).item())
-                if args.manual_seed == -1
-                else args.manual_seed
-            )
-            print(f"Using seed: {seed}")
-
-            # Extract filter flags with validation
-            filter_flags = extract_filter_flags(args)
-
-            # Call convert_to_mxfp8 with explicit args
-            convert_to_mxfp8(
-                args.input,
-                args.output,
-                # Filter flags
-                filter_flags=filter_flags,
-                exclude_layers=args.exclude_layers,
-                # Quantization options
-                simple=args.simple,
-                num_iter=args.num_iter,
-                heur=args.heur,
-                calib_samples=args.calib_samples,
-                seed=seed,
-                # Optimizer/LR options
-                optimizer=args.optimizer,
-                lr=args.lr,
-                lr_schedule=args.lr_schedule,
-                top_p=args.top_p,
-                min_k=args.min_k,
-                max_k=args.max_k,
-                full_matrix=args.full_matrix,
-                # LR schedule tuning
-                lr_gamma=args.lr_gamma,
-                lr_patience=args.lr_patience,
-                lr_factor=args.lr_factor,
-                lr_min=args.lr_min,
-                lr_cooldown=args.lr_cooldown,
-                lr_threshold=args.lr_threshold,
-                lr_adaptive_mode=args.lr_adaptive_mode,
-                lr_shape_influence=args.lr_shape_influence,
-                lr_threshold_mode=args.lr_threshold_mode,
-                # Early stopping
-                early_stop_loss=args.early_stop_loss,
-                early_stop_lr=args.early_stop_lr,
-                early_stop_stall=args.early_stop_stall,
-                # Scale optimization
-                scale_refinement_rounds=args.scale_refinement_rounds,
-                scale_optimization=args.scale_optimization,
-                # Memory mode
-                low_memory=args.low_memory,
-                devices=target_devices,
-                # Prodigy specific
-                use_speed=args.use_speed,
-                # LoRA options
-                extract_lora=args.extract_lora,
-                lora_rank=args.lora_rank,
-                lora_target=args.lora_target,
-                lora_depth=args.lora_depth,
-                lora_ar_threshold=args.lora_ar_threshold,
-                lora_output=args.lora_output,
-                # Checkpointing options
-                resume=args.resume,
-                sidecar_path=args.sidecar_path,
-                max_shard_size=args.max_shard_size,
-                no_checkpoint=args.no_checkpoint,
-            )
-            return
-
-    # Handle W4A8 INT8 quantization mode (dedicated workflow)
-    if getattr(args, "w4a8_int8", False):
-        needs_mixing = args.custom_type or args.fallback or args.layer_config
-        if needs_mixing:
-            print("W4A8 INT8 with custom/fallback: using unified quantization path")
-            if not args.output:
-                base = os.path.splitext(args.input)[0]
-                args.output = f"{base}_w4a8_int8_mixed.safetensors"
-            args.int8 = False
-        else:
-            if not args.output:
-                base = os.path.splitext(args.input)[0]
-                prefix = "simple_" if args.simple else "learned_"
-                filter_flags = extract_filter_flags(args)
-                has_filters = any(filter_flags.values())
-                has_custom = bool(args.custom_layers)
-                mixed_suffix = "mixed" if (has_filters or has_custom) else ""
-                args.output = f"{base}_{prefix}w4a8_int8{mixed_suffix}.safetensors"
-
-            if not os.path.exists(args.input):
-                print(f"Error: Input file not found: {args.input}")
-                return
-
-            if os.path.abspath(args.input) == os.path.abspath(args.output):
-                print("Error: Output file cannot be same as input.")
-                return
-
-            filter_flags = extract_filter_flags(args)
-            convert_to_w4a8_int8(
-                args.input,
-                args.output,
-                comfy_quant=args.comfy_quant,
-                calib_samples=args.calib_samples,
-                seed=(
-                    int(torch.randint(0, 2**32 - 1, ()).item()) if args.manual_seed == -1 else args.manual_seed
-                ),
-                filter_flags=filter_flags,
-                exclude_layers=args.exclude_layers,
-                simple=args.simple,
-                group_size=args.block_size or 16,
-                convrot_group_size=args.convrot_group_size,
-                low_memory=args.low_memory,
-                devices=target_devices,
-                # Optimizer/LR options
-                optimizer=args.optimizer,
-                num_iter=args.num_iter,
-                lr=args.lr,
-                lr_schedule=args.lr_schedule,
-                top_p=args.top_p,
-                min_k=args.min_k,
-                max_k=args.max_k,
-                full_matrix=args.full_matrix,
-                lr_gamma=args.lr_gamma,
-                lr_patience=args.lr_patience,
-                lr_factor=args.lr_factor,
-                lr_min=args.lr_min,
-                lr_cooldown=args.lr_cooldown,
-                lr_threshold=args.lr_threshold,
-                lr_adaptive_mode=args.lr_adaptive_mode,
-                lr_shape_influence=args.lr_shape_influence,
-                lr_threshold_mode=args.lr_threshold_mode,
-                early_stop_loss=args.early_stop_loss,
-                early_stop_lr=args.early_stop_lr,
-                early_stop_stall=args.early_stop_stall,
-                use_speed=args.use_speed,
-                # LoRA options
-                extract_lora=args.extract_lora,
-                lora_rank=args.lora_rank,
-                lora_target=args.lora_target,
-                lora_depth=args.lora_depth,
-                lora_ar_threshold=args.lora_ar_threshold,
-                lora_output=args.lora_output,
-                # Checkpointing options
-                resume=args.resume,
-                sidecar_path=args.sidecar_path,
-                max_shard_size=args.max_shard_size,
-                no_checkpoint=args.no_checkpoint,
-            )
-            return
-
-    # Handle legacy input scale addition mode (separate workflow)
-    if args.legacy_input_add:
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_with_input_scale.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        add_legacy_input_scale(args.input, args.output)
-        return
-
-    # Handle legacy FP8 cleanup mode (separate workflow)
-    if args.cleanup_fp8_scaled:
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_cleaned.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        cleanup_fp8_scaled(
-            args.input,
-            args.output,
-            marker_size=args.scaled_fp8_marker,
-            add_scale_input=args.input_scale,
-        )
-        return
-
-    # Handle activation scale calibration mode
-    if args.actcal:
-        try:
-            from ..calibrate_activation_scales import (
-                calibrate_model,
-                load_lora_tensors,
-                patch_model_with_scales,
-            )
-        except ImportError:
-            try:
-                from convert_to_quant.calibrate_activation_scales import (
-                    calibrate_model,
-                    load_lora_tensors,
-                    patch_model_with_scales,
-                )
-            except ImportError:
-                from calibrate_activation_scales import (
-                    calibrate_model,
-                    load_lora_tensors,
-                    patch_model_with_scales,
-                )
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        print(f"Loading model for activation calibration: {args.input}")
-        tensors = load_file(args.input)
-        print(f"  Total tensors: {len(tensors)}")
-
-        # Load LoRA if specified
-        lora_tensors = None
-        if args.actcal_lora:
-            if not os.path.exists(args.actcal_lora):
-                print(f"Error: LoRA file not found: {args.actcal_lora}")
-                return
-            print(f"\nLoading LoRA: {args.actcal_lora}")
-            lora_tensors = load_lora_tensors(args.actcal_lora)
-            print(f"  LoRA layers found: {len(lora_tensors)}")
-
-        mode = "LoRA-informed" if lora_tensors else "random"
-        print(f"\nCalibrating input_scale using {mode} PTQ ({args.actcal_samples} samples)...")
-        actcal_scales = calibrate_model(
-            tensors,
-            calib_samples=args.actcal_samples,
-            seed=args.actcal_seed,
-            percentile=args.actcal_percentile,
-            verbose=True,
-            lora_tensors=lora_tensors,
-            device=args.actcal_device,
-        )
-        print(f"\nCalibrated {len(actcal_scales)} layers")
-        args.input_scale = True
-
-        # Check if user requested a quantization workflow in the same command
-        is_quantization_requested = bool(
-            getattr(args, "int4", False)
-            or args.nvfp4
-            or args.mxfp8
-            or args.int8
-            or args.convert_fp8_scaled
-            or args.convert_int8_scaled
-            or args.custom_layers
-            or args.custom_type
-        )
-
-        if not is_quantization_requested:
-            if not args.output:
-                base = os.path.splitext(args.input)[0]
-                args.output = f"{base}_calibrated.safetensors"
-
-            if os.path.abspath(args.input) == os.path.abspath(args.output):
-                print("Error: Output file cannot be same as input.")
-                return
-
-            print("\nPatching model with calibrated scales...")
-            patched = patch_model_with_scales(tensors, actcal_scales)
-
-            print(f"Saving to: {args.output}")
-            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-            save_file(patched, args.output)
-            print("Done!")
-            return
-        else:
-            del tensors
-            import gc
-            gc.collect()
-
-    # Handle comfy_quant editing mode (separate workflow)
-    if args.edit_quant:
-        if not args.output:
-            base = os.path.splitext(args.input)[0]
-            args.output = f"{base}_edited.safetensors"
-
-        if not os.path.exists(args.input):
-            print(f"Error: Input file not found: {args.input}")
-            return
-
-        if os.path.abspath(args.input) == os.path.abspath(args.output):
-            print("Error: Output file cannot be same as input.")
-            return
-
-        if not args.remove_keys and not args.add_keys and not args.save_quant_metadata:
-            print(
-                "Error: --edit-quant requires at least one of --remove-keys, --add-keys, or --save-quant-metadata"
-            )
-            return
-
-        # Parse remove_keys from comma-separated string
-        remove_keys_list = None
-        if args.remove_keys:
-            remove_keys_list = [k.strip() for k in args.remove_keys.split(",") if k.strip()]
-
-        edit_comfy_quant(
-            args.input,
-            args.output,
-            remove_keys=remove_keys_list,
-            add_keys_str=args.add_keys,
-            layer_filter=args.quant_filter,
-            save_quant_metadata=args.save_quant_metadata,
-        )
-        return
-
-    # Determine which formats require block_size
-    primary_needs_block_size = args.int8 and args.scaling_mode != "tensor"
-    custom_needs_block_size = args.custom_type == "int8" and args.custom_scaling_mode != "tensor"
-    fallback_needs_block_size = args.fallback == "int8"
-
-    # Validate block_size for primary format
-    if primary_needs_block_size and args.block_size is None:
-        print("Error: --block_size is required when using INT8 quantization.")
-        print("       Example: --block_size 128")
-        sys.exit(1)
-
-    # Validate custom-block-size for custom format
-    if args.custom_type and custom_needs_block_size and args.custom_block_size is None:
-        print(
-            f"Error: --custom-block-size is required when using --custom-type {args.custom_type}."
-        )
-        print("       Example: --custom-block-size 128")
-        sys.exit(1)
-
-    # Validate fallback-block-size for fallback format
-    if args.fallback and fallback_needs_block_size and args.fallback_block_size is None:
-        print(f"Error: --fallback-block-size is required when using --fallback {args.fallback}.")
-        print("       Example: --fallback-block-size 128")
-        sys.exit(1)
+    target_devices = parse_devices(device=args.device, devices=getattr(args, "devices", None), num_gpus=getattr(args, "num_gpus", None))
 
     if not os.path.exists(args.input):
         print(f"Error: Input file not found: {args.input}")
         return
 
-    # Auto-enable comfy_quant if custom-type is used (required for mixed precision)
-    if args.custom_type and not args.comfy_quant:
-        print("Note: --comfy_quant auto-enabled (required for --custom-type mixed precision)")
-        args.comfy_quant = True
-
-    # Only check FP8 support if not using INT8
-    if not args.int8:
-        try:
-            _ = torch.zeros(
-                1, dtype=TARGET_FP8_DTYPE, device="cuda" if torch.cuda.is_available() else "cpu"
-            )
-        except (RuntimeError, TypeError):
-            print("Error: This hardware/PyTorch version does not support the target FP8 dtype.")
-            return
-
     if not args.output:
         base = os.path.splitext(args.input)[0]
-        # Build filename: {simple_|learned_}{format}[mixed]_{scaling}
-        # TODO: SVD stats (k, top_p, lr) should be saved to _convert_to_quant_stats metadata entry
         prefix = "simple_" if args.simple else "learned_"
-        if args.int8:
-            format_str = "int8"
-            if args.scaling_mode == "tensor":
-                scaling_str = "_tensorwise"
-            elif args.scaling_mode == "row":
-                scaling_str = "_rowwise"
-            else:
-                scaling_str = f"_bs{args.block_size}"
-        else:
-            format_str = "fp8"
-            scaling_str = f"_{args.scaling_mode}"
-        # Check for filters or custom-layers (metadata tracks specifics)
-        filter_flags = extract_filter_flags(args)
-        has_filters = any(filter_flags.values())
-        has_custom = bool(args.custom_layers)
-        mixed_suffix = "mixed" if (has_filters or has_custom) else ""
-        output_file = f"{base}_{prefix}{format_str}{mixed_suffix}{scaling_str}.safetensors"
+        output_file = f"{base}_{prefix}convrot_w4a4.safetensors"
     else:
         output_file = args.output
 
-    # Extract filter flags (needed for convert_to_fp8_scaled call)
-    # This is done after output filename logic to avoid duplicate call when auto-generating filename
-    if args.output:
-        filter_flags = extract_filter_flags(args)
+    filter_flags = extract_filter_flags(args)
 
     if os.path.abspath(args.input) == os.path.abspath(output_file):
         print("Error: Output file cannot be same as input.")
         return
 
-    seed = (
-        int(torch.randint(0, 2**32 - 1, ()).item()) if args.manual_seed == -1 else args.manual_seed
-    )
+    seed = int(torch.randint(0, 2**32 - 1, ()).item()) if args.manual_seed == -1 else args.manual_seed
     print(f"Using seed: {seed}")
 
-    # Load layer config if specified
-    layer_config_data = None
-    if args.layer_config:
-        layer_config_data = load_layer_config(args.layer_config)
+    layer_config_data = load_layer_config(args.layer_config) if args.layer_config else None
 
-    # Load input scales if provided or calibrated
-    input_scales = None
-    if args.input_scales_path:
-        if not os.path.exists(args.input_scales_path):
-            print(f"Error: Input scales file not found: {args.input_scales_path}")
-            return
-        input_scales = load_input_scales(args.input_scales_path)
-        print(f"Loaded {len(input_scales)} input scales from: {args.input_scales_path}")
-    elif actcal_scales:
-        input_scales = actcal_scales
-
-    # Determine primary_format for INT4/NVFP4/MXFP8 mode
-    primary_format = None
-    if getattr(args, "int4", False):
-        primary_format = "int4"
-        args.convrot = True
-    elif args.nvfp4 and (args.custom_type or args.fallback or args.layer_config):
-        primary_format = "nvfp4"
-    elif args.mxfp8 and (args.custom_type or args.fallback or args.layer_config):
-        primary_format = "mxfp8"
-
-    convert_to_fp8_scaled(
+    convert_to_int4_convrot(
         args.input,
         output_file,
-        args.comfy_quant,
-        # Filter flags
+        comfy_quant=args.comfy_quant,
         filter_flags=filter_flags,
-        # Calibration
         calib_samples=args.calib_samples,
         calib_cpu=args.calib_cpu,
         seed=seed,
-        # Format options
-        int8=args.int8,
-        primary_format=primary_format,
-        fallback=args.fallback,
-        # Custom layer options
         custom_layers=args.custom_layers,
         exclude_layers=args.exclude_layers,
-        custom_type=args.custom_type,
-        custom_block_size=args.custom_block_size,
-        custom_scaling_mode=args.custom_scaling_mode,
-        custom_simple=args.custom_simple,
-        custom_heur=args.custom_heur,
-        custom_full_precision_mm=args.custom_full_precision_mm,
-        custom_convrot=args.custom_convrot,
-        custom_convrot_group_size=args.custom_convrot_group_size,
-        convrot=args.convrot,
+        block_size=args.block_size,
         convrot_group_size=args.convrot_group_size,
         dynamic_convrot=args.dynamic_convrot,
         w4a4_untouched_activations=getattr(args, "w4a4_untouched_activations", False),
-        # Fallback options
-        fallback_block_size=args.fallback_block_size,
-        fallback_simple=args.fallback_simple,
-        # Precision options
         full_precision_matrix_mult=args.full_precision_matrix_mult,
         skip_inefficient_layers=args.heur,
-        include_input_scale=args.input_scale,
         no_learned_rounding=args.simple,
-        # Layer config
         layer_config=layer_config_data,
         layer_config_fullmatch=args.layer_config_fullmatch,
-        # Output options
         save_quant_metadata=args.save_quant_metadata,
         low_memory=args.low_memory,
         device=args.device,
         devices=target_devices,
-        # Optimizer/LR options (passed to LearnedRoundingConverter)
         optimizer=args.optimizer,
         num_iter=args.num_iter,
         lr=args.lr,
@@ -1848,8 +309,6 @@ def run_conversion(args):
         max_k=args.max_k,
         full_matrix=args.full_matrix,
         scaling_mode=args.scaling_mode,
-        block_size=args.block_size,
-        # LR schedule tuning
         lr_gamma=args.lr_gamma,
         lr_patience=args.lr_patience,
         lr_factor=args.lr_factor,
@@ -1859,24 +318,18 @@ def run_conversion(args):
         lr_adaptive_mode=args.lr_adaptive_mode,
         lr_shape_influence=args.lr_shape_influence,
         lr_threshold_mode=args.lr_threshold_mode,
-        # Early stopping
         early_stop_loss=args.early_stop_loss,
         early_stop_lr=args.early_stop_lr,
         early_stop_stall=args.early_stop_stall,
-        # Scale optimization
         scale_optimization=args.scale_optimization,
-        # Prodigy specific
-        use_speed=args.use_speed,
-        # LoRA options
+        use_speed=getattr(args, "use_speed", False),
         extract_lora=args.extract_lora,
         lora_rank=args.lora_rank,
         lora_target=args.lora_target,
         lora_depth=args.lora_depth,
         lora_ar_threshold=args.lora_ar_threshold,
         lora_output=args.lora_output,
-        input_scales=input_scales,
         actcal_lora=args.actcal_lora,
-        # Checkpointing options
         resume=args.resume,
         sidecar_path=args.sidecar_path,
         max_shard_size=args.max_shard_size,
