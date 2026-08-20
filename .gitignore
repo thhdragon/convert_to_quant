@@ -210,3 +210,9 @@ __marimo__/
 flux2-dev-testlayers.safetensors
 out_*.safetensors
 _test_filter_input.safetensors
+
+# dont upload model weights readily available on HF
+tests/real_world_test_models/*
+
+# calibration data (setup later after PoC to use a custom HF dataset)
+data/*

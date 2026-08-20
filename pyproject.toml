@@ -77,3 +77,7 @@ split_before_named_assigns = false
 dedent_closing_brackets = true
 join_multiple_lines = false
 indent_width = 4
+
+[tool.uv]
+find-links = ["https://repo.amd.com/rocm/whl-multi-arch/"]
+

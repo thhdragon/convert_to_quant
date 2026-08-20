@@ -17,6 +17,8 @@ EXPERIMENTAL_ARGS = {
     "convrot_group_size",
     "dynamic_convrot",
     "w4a4_untouched_activations",
+    "smooth_convrot",
+    "smooth_alpha",
     "custom_layers",
     "custom_block_size",
     "custom_simple",

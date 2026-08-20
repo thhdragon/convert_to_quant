@@ -45,6 +45,8 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         dynamic_convrot: bool = False,
         scale_optimization: str = "fixed",
         w4a4_untouched_activations: bool = False,
+        smooth_convrot: bool = True,
+        smooth_alpha: float = 0.5,
         **kwargs,
     ):
         super().__init__(
@@ -67,12 +69,15 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             self.convrot = True
         self.scale_optimization = scale_optimization
         self.w4a4_untouched_activations = w4a4_untouched_activations
+        self.smooth_convrot = smooth_convrot
+        self.smooth_alpha = smooth_alpha
         self.has_bias = True
         self.calib_scale = 1.0
 
         verbose(f"LearnedRoundingConverter initialized for INT4 ConvRot W4A4 on device: {self.device}")
         verbose(f"  - Target format: {self.target_format}, Scaling mode: {self.scaling_mode}")
         if self.convrot:
+            verbose(f"  - ConvRot Hadamard rotation enabled (group_size={self.convrot_group_size}, smooth_convrot={self.smooth_convrot})")
             verbose(f"  - ConvRot Hadamard rotation enabled (group_size={self.convrot_group_size})")
 
     def convert(
@@ -174,9 +179,19 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             if layer_group_size is not None and N % layer_group_size == 0:
                 try:
+                    if self.smooth_convrot:
+                        from ..utils.convrot import balance_channels_smoothquant
+                        if calibration_data is not None and isinstance(calibration_data, torch.Tensor):
+                            calib_x = calibration_data.to(device=self.device, dtype=COMPUTE_DTYPE)
+                        else:
+                            calib_x = torch.randn(256, N, device=self.device, dtype=COMPUTE_DTYPE)
+                        W_float32, s_c = balance_channels_smoothquant(W_float32, calib_x, alpha=self.smooth_alpha)
+                        if calibration_data is not None and isinstance(calibration_data, torch.Tensor):
+                            calibration_data = calibration_data / s_c.unsqueeze(0).to(device=calibration_data.device)
+
                     H = build_hadamard(layer_group_size, device=self.device, dtype=COMPUTE_DTYPE)
                     W_float32 = rotate_weight(W_float32, H, layer_group_size)
-                    info(f"    - Applied ConvRot Hadamard rotation for INT4 (group_size={layer_group_size}).")
+                    info(f"    - Applied Smooth-ConvRot Hadamard rotation for INT4 (group_size={layer_group_size}).")
                     convrot_applied = True
                 except Exception as e:
                     warning(f"    - Failed to apply ConvRot for INT4: {e}")

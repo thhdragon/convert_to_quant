@@ -40,6 +40,8 @@ def convert_to_int4_convrot(
     convrot_group_size: int = 256,
     dynamic_convrot: bool = False,
     w4a4_untouched_activations: bool = False,
+    smooth_convrot: bool = True,
+    smooth_alpha: float = 0.5,
     full_precision_matrix_mult: bool = False,
     custom_full_precision_mm: bool = False,
     skip_inefficient_layers: bool = False,
@@ -93,7 +95,7 @@ def convert_to_int4_convrot(
     info("-" * 60)
     info("Target format: INT4 ConvRot W4A4 (4-bit signed quantization with group Hadamard rotation)")
     info(f"INT4 Range: [{INT4_MIN}, {INT4_MAX}]")
-    info(f"Block size: {block_size}, ConvRot group size: {convrot_group_size}")
+    info(f"Block size: {block_size}, ConvRot group size: {convrot_group_size}, Smooth-ConvRot: {smooth_convrot}")
     info("-" * 60)
 
     # Calibration cache configuration
@@ -131,6 +133,8 @@ def convert_to_int4_convrot(
     converter_kwargs["convrot_group_size"] = convrot_group_size
     converter_kwargs["dynamic_convrot"] = dynamic_convrot
     converter_kwargs["w4a4_untouched_activations"] = w4a4_untouched_activations
+    converter_kwargs["smooth_convrot"] = smooth_convrot
+    converter_kwargs["smooth_alpha"] = smooth_alpha
     converter_kwargs["no_learned_rounding"] = no_learned_rounding
     converter_kwargs["device"] = device
     converter_kwargs["extract_lora"] = extract_lora
@@ -275,9 +279,10 @@ def convert_to_int4_convrot(
         if depth_match:
             depth = int(depth_match.group(1))
 
-        # Check ConvRot compatibility with feature dimensions
-        if any(dim < 256 for dim in original_tensor.shape) or any(dim % 256 != 0 for dim in original_tensor.shape):
-            info(f"  - Dimension ({list(original_tensor.shape)}) not compatible with convrot (requires feature dim >= 256 and divisible by 256); keeping untouched in bf16")
+        # Check ConvRot compatibility with input feature dimension (in_features = shape[1])
+        in_features = original_tensor.shape[1]
+        if in_features < 256 or in_features % 256 != 0:
+            info(f"  - Input dimension {in_features} (shape {list(original_tensor.shape)}) not compatible with convrot (requires in_features >= 256 and divisible by 256); keeping untouched in bf16")
             return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=torch.bfloat16)}}
 
         convrot_group_size_layer = convrot_group_size

@@ -166,6 +166,9 @@ def get_parser() -> MultiHelpArgumentParser:
     parser.add_argument("--convrot-group-size", "--convrot_group_size", type=int, default=256, dest="convrot_group_size", help="Group size for ConvRot (default: 256).")
     parser.add_argument("--dynamic-convrot", "--dynamic_convrot", action="store_true", dest="dynamic_convrot", help="Enable dynamic ConvRot group sizing.")
     parser.add_argument("--w4a4-untouched-activations", "--w4a4_untouched_activations", action="store_true", dest="w4a4_untouched_activations", help="Leave calibration activations untouched during weight optimization.")
+    parser.add_argument("--smooth-convrot", "--smooth_convrot", action="store_true", default=True, dest="smooth_convrot", help="Enable Smooth-ConvRot channel dynamic range balancing prior to Hadamard rotation (enabled by default).")
+    parser.add_argument("--no-smooth-convrot", "--no_smooth_convrot", action="store_false", dest="smooth_convrot", help="Disable Smooth-ConvRot channel balancing.")
+    parser.add_argument("--smooth-alpha", "--smooth_alpha", type=float, default=0.5, dest="smooth_alpha", help="SmoothQuant alpha scaling parameter (default: 0.5).")
     parser.add_argument("--custom-layers", "--custom_layers", type=str, default=None, dest="custom_layers", help="Regex pattern for layers to quantize with custom options.")
     parser.add_argument("--exclude-layers", "--exclude_layers", type=str, default=None, dest="exclude_layers", help="Regex pattern for layers to exclude from quantization.")
     parser.add_argument("--custom-block-size", "--custom_block_size", type=int, default=None, dest="custom_block_size", help="Block size for custom layers.")
@@ -291,6 +294,8 @@ def run_conversion(args) -> None:
         convrot_group_size=args.convrot_group_size,
         dynamic_convrot=args.dynamic_convrot,
         w4a4_untouched_activations=getattr(args, "w4a4_untouched_activations", False),
+        smooth_convrot=getattr(args, "smooth_convrot", True),
+        smooth_alpha=getattr(args, "smooth_alpha", 0.5),
         full_precision_matrix_mult=args.full_precision_matrix_mult,
         custom_full_precision_mm=getattr(args, "custom_full_precision_mm", False),
         skip_inefficient_layers=args.heur,
