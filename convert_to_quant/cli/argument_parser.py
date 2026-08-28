@@ -81,7 +81,9 @@ MODES_ARGS = {
     "quant_filter",
     "dry_run",
     "full_precision_mm",
+    "calib_data",
 }
+
 
 LORA_ARGS = {"extract_lora", "lora_rank", "lora_target", "lora_depth", "lora_ar_threshold", "lora_output"}
 

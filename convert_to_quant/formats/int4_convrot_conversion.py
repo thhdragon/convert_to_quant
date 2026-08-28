@@ -61,6 +61,7 @@ def convert_to_int4_convrot(
     lora_save_path: Optional[str] = None,
     lora_output: Optional[str] = None,
     actcal_lora: Optional[str] = None,
+    calib_data: Optional[str] = None,
     # Checkpointing & Resume options
     resume: bool = False,
     sidecar_path: Optional[str] = None,
@@ -72,6 +73,7 @@ def convert_to_int4_convrot(
     Main conversion entry point for INT4 ConvRot W4A4 quantization.
     """
     filter_flags = filter_flags or {}
+
 
     from ..utils.checkpoint import QuantCheckpointManager
     from ..utils.parallel_utils import parse_devices, run_parallel_layer_processing
@@ -171,6 +173,15 @@ def convert_to_int4_convrot(
                 shutil.rmtree(calib_cache_dir)
             return
 
+    real_calib_loader = None
+    if calib_data and os.path.exists(calib_data):
+        try:
+            from ..utils.calibration_loader import CalibrationDataLoader
+            info(f"Loading real activation calibration data from: {calib_data}")
+            real_calib_loader = CalibrationDataLoader(calib_data, max_tokens=calib_samples, seed=seed)
+        except Exception as e:
+            warning(f"Failed to load calibration data from '{calib_data}': {e}")
+
     lora_key_map = {}
     if actcal_lora and os.path.exists(actcal_lora):
         try:
@@ -202,6 +213,7 @@ def convert_to_int4_convrot(
                         calibration_data_cache[in_features] = calib_tensor
 
     info("Calibration data prepared.\n")
+
 
     new_tensors: Dict[str, torch.Tensor] = {}
     lora_tensors: Dict[str, torch.Tensor] = {}
@@ -296,8 +308,16 @@ def convert_to_int4_convrot(
         in_features = original_tensor.shape[1]
         base_name = key[: key.rfind(".weight")]
 
+        real_calib = None
+        if real_calib_loader is not None and real_calib_loader.has_layer(key):
+            real_calib = real_calib_loader.get_calibration_tensor(
+                key, max_tokens=calib_samples, dtype=COMPUTE_DTYPE
+            )
+            if real_calib is not None:
+                info(f"  - Using real activation calibration data ({real_calib.shape[0]} tokens, in_features={real_calib.shape[1]}) for {key}")
+
         lora_calib = None
-        if lora_key_map and base_name in lora_key_map and "lora_A" in lora_key_map[base_name]:
+        if real_calib is None and lora_key_map and base_name in lora_key_map and "lora_A" in lora_key_map[base_name]:
             lora_A = lora_key_map[base_name]["lora_A"]
             x_base = lora_A.to(dtype=COMPUTE_DTYPE, device="cpu")
             gen = torch.Generator(device="cpu").manual_seed(seed if seed != -1 else 42)
@@ -306,7 +326,10 @@ def convert_to_int4_convrot(
             x_calib = torch.cat([x_base, x_base + 0.1 * n1, x_base + 0.2 * n2, x_base * -1])
             lora_calib = x_calib / x_calib.std().clamp(min=1e-6)
 
-        if lora_calib is not None:
+        if real_calib is not None:
+            calibration_data = real_calib
+            calib_data_loaded = True
+        elif lora_calib is not None:
             calibration_data = lora_calib
             calib_data_loaded = False
         else:
@@ -322,6 +345,7 @@ def convert_to_int4_convrot(
         q_tensor, dequant_s, dequant_w, extra_tensors = converter.convert(
             original_tensor, key=key, depth=depth, calibration_data=calibration_data, has_bias=has_bias
         )
+
 
         if calib_data_loaded and calibration_data is not None:
             del calibration_data

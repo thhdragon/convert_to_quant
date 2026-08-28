@@ -228,8 +228,10 @@ def get_parser() -> MultiHelpArgumentParser:
     parser.add_argument("--low-memory", "--low_memory", action="store_true", dest="low_memory", help="Use memory-efficient loading.")
     parser.add_argument("--dry-run", "--dry_run", action="store_true", dest="dry_run", help="Report layer routing plan without converting.")
     parser.add_argument("--actcal_lora", "--actcal-lora", type=str, default=None, dest="actcal_lora", help="Path to LoRA file for calibration.")
+    parser.add_argument("--calib-data", "--calib_data", "--calib-dir", "--calib_dir", type=str, default=None, dest="calib_data", help="Path to real activation calibration directory or .safetensors file.")
 
     return parser
+
 
 
 def run_conversion(args) -> None:
@@ -336,8 +338,10 @@ def run_conversion(args) -> None:
         lora_ar_threshold=args.lora_ar_threshold,
         lora_output=args.lora_output,
         actcal_lora=args.actcal_lora,
+        calib_data=getattr(args, "calib_data", None),
         resume=args.resume,
         sidecar_path=args.sidecar_path,
+
         max_shard_size=args.max_shard_size,
         no_checkpoint=args.no_checkpoint,
     )

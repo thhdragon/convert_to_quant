@@ -216,3 +216,4 @@ tests/real_world_test_models/*
 
 # calibration data (setup later after PoC to use a custom HF dataset)
 data/*
+calibration_data/*
