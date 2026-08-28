@@ -62,6 +62,10 @@ def convert_to_int4_convrot(
     lora_output: Optional[str] = None,
     actcal_lora: Optional[str] = None,
     calib_data: Optional[str] = None,
+    auto_fallback: bool = False,
+    min_snr_db: float = 0.0,
+    min_cossim: float = 0.0,
+    fallback_unresponsive: bool = False,
     # Checkpointing & Resume options
     resume: bool = False,
     sidecar_path: Optional[str] = None,
@@ -73,6 +77,7 @@ def convert_to_int4_convrot(
     Main conversion entry point for INT4 ConvRot W4A4 quantization.
     """
     filter_flags = filter_flags or {}
+
 
 
     from ..utils.checkpoint import QuantCheckpointManager
@@ -128,6 +133,13 @@ def convert_to_int4_convrot(
     quant_metadata_layers = {} if save_quant_metadata else None
 
     # Configure converter parameters for INT4 ConvRot W4A4
+    if auto_fallback:
+        if min_snr_db <= 0.0:
+            min_snr_db = 16.0
+        if min_cossim <= 0.0:
+            min_cossim = 0.985
+        fallback_unresponsive = True
+
     converter_kwargs["target_format"] = "int4"
     converter_kwargs["scaling_mode"] = "row"
     converter_kwargs["block_size"] = block_size
@@ -144,6 +156,13 @@ def convert_to_int4_convrot(
     converter_kwargs["lora_target"] = lora_target
     converter_kwargs["lora_depth"] = lora_depth
     converter_kwargs["lora_ar_threshold"] = lora_ar_threshold
+    converter_kwargs["min_snr_db"] = min_snr_db
+    converter_kwargs["min_cossim"] = min_cossim
+    converter_kwargs["fallback_unresponsive"] = fallback_unresponsive
+
+    if min_snr_db > 0.0 or min_cossim > 0.0 or fallback_unresponsive:
+        info(f"Sensitivity Fallback Protection Active: min_snr={min_snr_db}dB, min_cossim={min_cossim}, fallback_unresponsive={fallback_unresponsive}")
+
 
     def create_int4_converter(target_device: Optional[str] = None):
         kwargs = converter_kwargs.copy()
@@ -369,6 +388,41 @@ def convert_to_int4_convrot(
                         full_lora_key = f"diffusion_model.{base_key}.{lora_key}.weight"
                     res_lora[full_lora_key] = lora_tensor.cpu()
 
+        # Check if 4-bit sensitivity fallback was triggered
+        fallback_info = extra_tensors.get("fallback", {}) if extra_tensors else {}
+        if fallback_info.get("should_fallback", False):
+            reasons = fallback_info.get("reasons", [])
+            snr_val = fallback_info.get("snr_db", 0.0)
+            cossim_val = fallback_info.get("cos_sim", 0.0)
+            warning(f"[{dev}] [4-BIT SENSITIVITY FALLBACK] Layer '{key}' failed quality threshold: {', '.join(reasons)}")
+            warning(f"[{dev}] -> Retaining '{key}' in original unquantized BF16 precision.")
+
+            res_tensors[key] = original_tensor.to(device="cpu", dtype=torch.bfloat16)
+            bias_key = f"{base_name}.bias"
+            if bias_key in all_keys:
+                original_bias = loader.get_tensor(bias_key)
+                res_tensors[bias_key] = original_bias.to(device="cpu", dtype=original_bias.dtype)
+
+            info("-" * 60)
+            del original_tensor, q_tensor, dequant_s, dequant_w
+            gc.collect()
+            if str(dev).startswith("cuda"):
+                torch.cuda.empty_cache()
+
+            res_item = {
+                "key": key,
+                "base_name": base_name,
+                "tensors": res_tensors,
+                "lora_tensors": res_lora,
+                "meta_entry": None,
+                "skipped": False,
+                "fallback": True,
+                "fallback_reasons": reasons,
+                "metrics": extra_tensors.get("metrics", {}),
+            }
+            checkpoint_mgr.save_layer_checkpoint(res_item)
+            return res_item
+
         res_tensors[key] = q_tensor.to(device="cpu")
         bias_key = f"{base_name}.bias"
 
@@ -476,17 +530,28 @@ def convert_to_int4_convrot(
             "lora_tensors": res_lora,
             "meta_entry": meta_entry,
             "skipped": False,
+            "fallback": False,
+            "metrics": extra_tensors.get("metrics", {}) if extra_tensors else {},
         }
         checkpoint_mgr.save_layer_checkpoint(res_item)
         return res_item
 
     layer_results = run_parallel_layer_processing(work_items, process_layer_item, target_devices)
 
+    quantized_count = 0
+    fallback_count = 0
+    fallback_layers_info = []
+
     for r in layer_results:
         checkpoint_mgr.save_layer_checkpoint(r)
         if r.get("skipped"):
             skipped_count += 1
+        elif r.get("fallback"):
+            fallback_count += 1
+            fallback_layers_info.append(r)
+            processed_count += 1
         else:
+            quantized_count += 1
             processed_count += 1
 
         if "tensors" in r:
@@ -495,6 +560,7 @@ def convert_to_int4_convrot(
             lora_tensors.update(r["lora_tensors"])
         if "base_name" in r and r.get("meta_entry") and quant_metadata_layers is not None:
             quant_metadata_layers[r["base_name"]] = r["meta_entry"]
+
 
     # Copy remaining tensors (norms, etc.)
     passthrough_tensors: Dict[str, torch.Tensor] = {}
@@ -531,7 +597,21 @@ def convert_to_int4_convrot(
     info("-" * 60)
     info("Summary:")
     info(f"  - Original tensor count : {len(all_keys)}")
-    info(f"  - Weights processed     : {processed_count}")
-    info(f"  - Weights skipped       : {skipped_count}")
+    info(f"  - Total weights reviewed: {processed_count + skipped_count}")
+    info(f"  - INT4 Quantized layers : {quantized_count}")
+    info(f"  - BF16 Fallback layers  : {fallback_count}")
+    info(f"  - Skipped layers        : {skipped_count}")
     info(f"  - Final tensor count    : {len(new_tensors)}")
+    if fallback_layers_info:
+        info("\n  [4-Bit Sensitivity Fallback Breakdown]:")
+        for fl in fallback_layers_info:
+            k = fl.get("key", "unknown")
+            reasons = fl.get("fallback_reasons", [])
+            m = fl.get("metrics", {})
+            snr = m.get("snr_db", 0.0)
+            cossim = m.get("cos_sim", 0.0)
+            delta = m.get("opt_improvement")
+            d_str = f", AdaRound Delta: {delta:+.2%}" if delta is not None else ""
+            info(f"    * {k} (SNR: {snr:.2f} dB, CosSim: {cossim:.4f}{d_str}) -> {', '.join(reasons)}")
     info("Conversion complete!")
+

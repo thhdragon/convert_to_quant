@@ -73,11 +73,16 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         self.smooth_alpha = smooth_alpha
         self.has_bias = True
         self.calib_scale = 1.0
+        self.min_snr_db = kwargs.get("min_snr_db", 0.0)
+        self.min_cossim = kwargs.get("min_cossim", 0.0)
+        self.fallback_unresponsive = kwargs.get("fallback_unresponsive", False)
+        self._last_opt_improvement = None
 
         verbose(f"LearnedRoundingConverter initialized for INT4 ConvRot W4A4 on device: {self.device}")
         verbose(f"  - Target format: {self.target_format}, Scaling mode: {self.scaling_mode}")
         if self.convrot:
             verbose(f"  - ConvRot Hadamard rotation enabled (group_size={self.convrot_group_size}, smooth_convrot={self.smooth_convrot})")
+
             verbose(f"  - ConvRot Hadamard rotation enabled (group_size={self.convrot_group_size})")
 
     def convert(
@@ -250,11 +255,68 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 bias_adj = (Y_ref_bias - Y_quant).mean(dim=0)
                 self._current_extra_tensors["bias_correction"] = bias_adj.cpu()
 
+        # Quality & Sensitivity Metrics Evaluation
+        if X_rot is not None and Y_ref is not None:
+            with torch.no_grad():
+                if self.w4a4_untouched_activations:
+                    eval_act = X_rot
+                else:
+                    from ..comfy.int4_kernels import quantize_signed_int4_rowwise
+                    qact, x_scales = quantize_signed_int4_rowwise(X_rot)
+                    eval_act = unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
+
+                Y_sim = eval_act @ dequantized_rot.T
+                if "bias_correction" in self._current_extra_tensors:
+                    bias_adj = self._current_extra_tensors["bias_correction"].to(device=Y_sim.device, dtype=Y_sim.dtype)
+                    Y_sim = Y_sim + bias_adj
+
+                diff = Y_ref - Y_sim
+                ref_norm = torch.norm(Y_ref).item()
+                err_norm = torch.norm(diff).item()
+                snr_db = 20.0 * math.log10(ref_norm / max(err_norm, 1e-12)) if err_norm > 0 else float("inf")
+                cos_sim = torch.nn.functional.cosine_similarity(Y_ref.flatten(), Y_sim.flatten(), dim=0).item()
+                nmse = (err_norm ** 2) / max(ref_norm ** 2, 1e-12)
+                opt_imp = self._last_opt_improvement
+
+                metric_str = f"SNR = {snr_db:.2f} dB, CosSim = {cos_sim:.4f}, NMSE = {nmse:.3e}"
+                if opt_imp is not None:
+                    metric_str += f", AdaRound Delta = {opt_imp:+.2%}"
+                info(f"    - Layer 4-bit metrics: {metric_str}")
+
+                self._current_extra_tensors["metrics"] = {
+                    "snr_db": snr_db,
+                    "cos_sim": cos_sim,
+                    "nmse": nmse,
+                    "opt_improvement": opt_imp,
+                }
+
+                should_fallback = False
+                fallback_reasons = []
+                if self.min_snr_db > 0 and snr_db < self.min_snr_db:
+                    should_fallback = True
+                    fallback_reasons.append(f"SNR {snr_db:.2f} dB < {self.min_snr_db:.2f} dB")
+                if self.min_cossim > 0 and cos_sim < self.min_cossim:
+                    should_fallback = True
+                    fallback_reasons.append(f"CosSim {cos_sim:.4f} < {self.min_cossim:.4f}")
+                if self.fallback_unresponsive and opt_imp is not None and opt_imp <= 0 and snr_db < 22.0:
+                    should_fallback = True
+                    fallback_reasons.append(f"Unresponsive AdaRound ({opt_imp:+.2%}) with SNR {snr_db:.2f} dB")
+
+                if should_fallback:
+                    self._current_extra_tensors["fallback"] = {
+                        "should_fallback": True,
+                        "reasons": fallback_reasons,
+                        "snr_db": snr_db,
+                        "cos_sim": cos_sim,
+                        "nmse": nmse,
+                    }
+
         self._cleanup_tensors(W_float32)
         if X_rot is not None or Y_ref is not None or H_mat is not None:
             self._cleanup_tensors(X_rot, Y_ref, H_mat)
 
         return qdata, scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized
+
 
     def _optimize_int4_adaround(
         self,
@@ -474,7 +536,13 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             W_quant = (W_floor + best_V_binary).clamp(-7, 7)
             opt_qdata = pack_int4_row_major(W_quant.round().to(torch.int8))
 
+        if init_mse_rounded.item() > 1e-12 and best_loss < float("inf"):
+            self._last_opt_improvement = (init_mse_rounded.item() - best_loss) / init_mse_rounded.item()
+        else:
+            self._last_opt_improvement = 0.0
+
         if not self.w4a4_untouched_activations:
             self._cleanup_tensors(act_dequant)
         self._cleanup_tensors(U_k, Vh_k, V)
         return opt_qdata, scale
+

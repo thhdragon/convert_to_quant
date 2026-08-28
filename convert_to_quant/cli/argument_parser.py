@@ -82,7 +82,12 @@ MODES_ARGS = {
     "dry_run",
     "full_precision_mm",
     "calib_data",
+    "auto_fallback",
+    "min_snr_db",
+    "min_cossim",
+    "fallback_unresponsive",
 }
+
 
 
 LORA_ARGS = {"extract_lora", "lora_rank", "lora_target", "lora_depth", "lora_ar_threshold", "lora_output"}

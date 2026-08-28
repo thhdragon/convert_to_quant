@@ -229,8 +229,13 @@ def get_parser() -> MultiHelpArgumentParser:
     parser.add_argument("--dry-run", "--dry_run", action="store_true", dest="dry_run", help="Report layer routing plan without converting.")
     parser.add_argument("--actcal_lora", "--actcal-lora", type=str, default=None, dest="actcal_lora", help="Path to LoRA file for calibration.")
     parser.add_argument("--calib-data", "--calib_data", "--calib-dir", "--calib_dir", type=str, default=None, dest="calib_data", help="Path to real activation calibration directory or .safetensors file.")
+    parser.add_argument("--auto-fallback", "--auto_fallback", action="store_true", dest="auto_fallback", help="Automatically retain sensitive/unresponsive layers in BF16 (defaults to min SNR 16dB, CosSim 0.985).")
+    parser.add_argument("--min-snr-db", "--min_snr_db", "--fallback-snr", type=float, default=0.0, dest="min_snr_db", help="Minimum required SNR in dB for INT4 quantization (triggers BF16 fallback if below threshold).")
+    parser.add_argument("--min-cossim", "--min_cossim", "--fallback-cossim", type=float, default=0.0, dest="min_cossim", help="Minimum required Cosine Similarity for INT4 quantization.")
+    parser.add_argument("--fallback-unresponsive", "--fallback_unresponsive", action="store_true", dest="fallback_unresponsive", help="Fallback to BF16 if AdaRound optimization is unresponsive and SNR is marginal.")
 
     return parser
+
 
 
 
@@ -339,8 +344,13 @@ def run_conversion(args) -> None:
         lora_output=args.lora_output,
         actcal_lora=args.actcal_lora,
         calib_data=getattr(args, "calib_data", None),
+        auto_fallback=getattr(args, "auto_fallback", False),
+        min_snr_db=getattr(args, "min_snr_db", 0.0),
+        min_cossim=getattr(args, "min_cossim", 0.0),
+        fallback_unresponsive=getattr(args, "fallback_unresponsive", False),
         resume=args.resume,
         sidecar_path=args.sidecar_path,
+
 
         max_shard_size=args.max_shard_size,
         no_checkpoint=args.no_checkpoint,
