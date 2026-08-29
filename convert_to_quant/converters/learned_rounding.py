@@ -83,8 +83,6 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         if self.convrot:
             verbose(f"  - ConvRot Hadamard rotation enabled (group_size={self.convrot_group_size}, smooth_convrot={self.smooth_convrot})")
 
-            verbose(f"  - ConvRot Hadamard rotation enabled (group_size={self.convrot_group_size})")
-
     def convert(
         self,
         W_orig: torch.Tensor,
@@ -218,6 +216,8 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         scale = (row_max / 7.0).squeeze(1)
         scaled_int8 = (W_float32 / scale.unsqueeze(1)).round().clamp(-7, 7).to(torch.int8)
         qdata = pack_int4_row_major(scaled_int8)
+        init_qdata = qdata.clone()
+        init_scale = scale.clone()
 
         if not self.no_learned_rounding and self.num_iter > 0:
             info(f"    - Applying learned rounding optimization for INT4 ({self.scaling_mode}-wise)...")
@@ -265,29 +265,93 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     qact, x_scales = quantize_signed_int4_rowwise(X_rot)
                     eval_act = unpack_int4_row_major(qact).to(COMPUTE_DTYPE) * x_scales.unsqueeze(1)
 
+                ref_norm = torch.norm(Y_ref).item()
+
+                # 1. Baseline metrics (Initial round-to-nearest before AdaRound / bias correction)
+                base_dequant = unpack_int4_row_major(init_qdata).to(COMPUTE_DTYPE) * init_scale.unsqueeze(1)
+                Y_base = eval_act @ base_dequant.T
+                diff_base = Y_ref - Y_base
+                base_err_norm = torch.norm(diff_base).item()
+                base_snr = 20.0 * math.log10(ref_norm / max(base_err_norm, 1e-12)) if base_err_norm > 0 else float("inf")
+                base_cossim = torch.nn.functional.cosine_similarity(Y_ref.flatten(), Y_base.flatten(), dim=0).item()
+                base_nmse = (base_err_norm ** 2) / max(ref_norm ** 2, 1e-12)
+                base_rmse = math.sqrt(torch.mean(diff_base ** 2).item())
+                base_mae = torch.mean(torch.abs(diff_base)).item()
+
+                # 2. Optimized metrics (with AdaRound + Bias Correction)
                 Y_sim = eval_act @ dequantized_rot.T
                 if "bias_correction" in self._current_extra_tensors:
                     bias_adj = self._current_extra_tensors["bias_correction"].to(device=Y_sim.device, dtype=Y_sim.dtype)
                     Y_sim = Y_sim + bias_adj
 
                 diff = Y_ref - Y_sim
-                ref_norm = torch.norm(Y_ref).item()
                 err_norm = torch.norm(diff).item()
                 snr_db = 20.0 * math.log10(ref_norm / max(err_norm, 1e-12)) if err_norm > 0 else float("inf")
                 cos_sim = torch.nn.functional.cosine_similarity(Y_ref.flatten(), Y_sim.flatten(), dim=0).item()
                 nmse = (err_norm ** 2) / max(ref_norm ** 2, 1e-12)
+                rmse = math.sqrt(torch.mean(diff ** 2).item())
+                mae = torch.mean(torch.abs(diff)).item()
                 opt_imp = self._last_opt_improvement
 
-                metric_str = f"SNR = {snr_db:.2f} dB, CosSim = {cos_sim:.4f}, NMSE = {nmse:.3e}"
-                if opt_imp is not None:
-                    metric_str += f", AdaRound Delta = {opt_imp:+.2%}"
-                info(f"    - Layer 4-bit metrics: {metric_str}")
+                # Memory footprint comparison
+                M, N = W_float32.shape
+                orig_bytes = M * N * 2  # 16-bit BF16
+                quant_bytes = (M * N // 2) + (M * 2)  # 4-bit INT4 packed + 16-bit row scales
+                orig_mb = orig_bytes / (1024 * 1024)
+                quant_mb = quant_bytes / (1024 * 1024)
+                comp_ratio = orig_bytes / max(quant_bytes, 1)
+                mem_saved_pct = (1.0 - quant_bytes / orig_bytes) * 100
+
+                info("    - [Layer Comparison: Original vs New]")
+                info(f"      * Precision / Size: {orig_mb:.2f} MB (BF16) -> {quant_mb:.2f} MB (INT4 W4A4) [{comp_ratio:.2f}x compression, -{mem_saved_pct:.1f}%]")
+
+                has_improvement = (self._last_opt_improvement is not None and abs(snr_db - base_snr) > 1e-3)
+                if has_improvement:
+                    snr_delta = snr_db - base_snr
+                    cossim_delta = cos_sim - base_cossim
+                    nmse_delta_pct = ((nmse - base_nmse) / max(base_nmse, 1e-12))
+                    rmse_delta_pct = ((rmse - base_rmse) / max(base_rmse, 1e-12))
+                    mae_delta_pct = ((mae - base_mae) / max(base_mae, 1e-12))
+
+                    snr_str = f"{base_snr:.2f} dB -> {snr_db:.2f} dB ({snr_delta:+.2f} dB)" if not math.isinf(base_snr) else f"{snr_db:.2f} dB"
+                    cossim_str = f"{base_cossim:.4f} -> {cos_sim:.4f} ({cossim_delta:+.4f})"
+                    nmse_str = f"{base_nmse:.3e} -> {nmse:.3e} ({nmse_delta_pct:+.2%})"
+                    rmse_str = f"{base_rmse:.3e} -> {rmse:.3e} ({rmse_delta_pct:+.2%})"
+                    mae_str = f"{base_mae:.3e} -> {mae:.3e} ({mae_delta_pct:+.2%})"
+
+                    info(f"      * SNR (Quality)   : {snr_str}")
+                    info(f"      * Cosine Sim      : {cossim_str}")
+                    info(f"      * Output NMSE     : {nmse_str}")
+                    info(f"      * Output RMSE     : {rmse_str}")
+                    info(f"      * Output MAE      : {mae_str}")
+                    if opt_imp is not None:
+                        info(f"      * AdaRound Delta  : {opt_imp:+.2%}")
+                else:
+                    info(f"      * SNR (Quality)   : {snr_db:.2f} dB")
+                    info(f"      * Cosine Sim      : {cos_sim:.4f}")
+                    info(f"      * Output NMSE     : {nmse:.3e}")
+                    info(f"      * Output RMSE     : {rmse:.3e}")
+                    info(f"      * Output MAE      : {mae:.3e}")
+
+                info(f"    - Quantization scales: min = {scale.min().item():.3e}, max = {scale.max().item():.3e}, mean = {scale.mean().item():.3e}")
 
                 self._current_extra_tensors["metrics"] = {
                     "snr_db": snr_db,
                     "cos_sim": cos_sim,
                     "nmse": nmse,
+                    "rmse": rmse,
+                    "mae": mae,
                     "opt_improvement": opt_imp,
+                    "base_snr_db": base_snr,
+                    "base_cos_sim": base_cossim,
+                    "base_nmse": base_nmse,
+                    "base_rmse": base_rmse,
+                    "base_mae": base_mae,
+                    "scale_min": scale.min().item(),
+                    "scale_max": scale.max().item(),
+                    "scale_mean": scale.mean().item(),
+                    "shape": list(W_float32.shape),
+                    "numel": W_float32.numel(),
                 }
 
                 should_fallback = False
@@ -404,13 +468,15 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         target_converged_ratio = 0.90
 
         loss_history = []
+        completed_iters = 0
         pbar = tqdm(
             range(self.num_iter),
             desc=f"    Optimizing INT4 (AdaRound-{self.optimizer_choice}-{schedule_name})",
-            leave=False,
+            leave=True,
             dynamic_ncols=True,
         )
         for i in pbar:
+            completed_iters = i + 1
             if optimizer is not None:
                 optimizer.zero_grad()
 
@@ -524,9 +590,24 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 if improved and self.lr_adaptive_mode == "no-reset":
                     worse_loss_counter = 0
 
-            pbar.set_postfix({"loss": f"{current_loss_val:.3e}", "best": f"{best_loss:.3e}", "lr": f"{curr_lr:.2e}"})
+            if schedule_name == "plateau":
+                pbar.set_postfix({"loss": f"{current_loss_val:.3e}", "best": f"{best_loss:.3e}", "lr": f"{curr_lr:.2e}", "plateau": f"{plateau_counter}/{effective_patience}"})
+            else:
+                pbar.set_postfix({"loss": f"{current_loss_val:.3e}", "best": f"{best_loss:.3e}", "lr": f"{curr_lr:.2e}", "worse": f"{worse_loss_counter}"})
 
-            if (best_loss <= self.early_stop_loss or curr_lr <= self.early_stop_lr or worse_loss_counter > self.early_stop_stall):
+            if current_loss_val <= self.early_stop_loss or curr_lr <= self.early_stop_lr or worse_loss_counter > self.early_stop_stall:
+                if curr_lr <= self.early_stop_lr * 1.75 and worse_loss_counter > self.early_stop_stall * 0.95:
+                    info("\n      - Loss has stalled and learning rate has bottomed out. Stopping.")
+                elif current_loss_val <= self.early_stop_loss and curr_lr <= self.early_stop_lr * 1.75:
+                    info("\n      - Learning Rate has bottomed out and loss is negligible. Stopping.")
+                elif worse_loss_counter > self.early_stop_stall * 0.95 and current_loss_val > self.early_stop_loss * 2:
+                    info("\n      - Loss is negligible and loss has stalled. Stopping.")
+                elif current_loss_val <= self.early_stop_loss:
+                    info("\n      - Loss is negligible. Stopping.")
+                elif curr_lr <= self.early_stop_lr:
+                    info("\n      - Learning Rate has bottomed out. Stopping.")
+                elif worse_loss_counter > self.early_stop_stall:
+                    info("\n      - Loss has stalled. Stopping.")
                 break
 
         pbar.close()
@@ -540,6 +621,9 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             self._last_opt_improvement = (init_mse_rounded.item() - best_loss) / init_mse_rounded.item()
         else:
             self._last_opt_improvement = 0.0
+
+        loss_reduction = self._last_opt_improvement if self._last_opt_improvement is not None else 0.0
+        info(f"    - Optimization stats: {completed_iters}/{self.num_iter} iters | Loss: {init_mse_rounded.item():.3e} -> {best_loss:.3e} ({loss_reduction:+.2%}) | Converged: {best_converged_ratio * 100:.1f}%")
 
         if not self.w4a4_untouched_activations:
             self._cleanup_tensors(act_dequant)

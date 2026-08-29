@@ -7,10 +7,12 @@ INT4 W4A4 quantization with group-wise Hadamard rotation (ConvRot) and learned r
 
 import gc
 import json
+import math
 import os
 import re
 import shutil
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -297,6 +299,14 @@ def convert_to_int4_convrot(
             info(f"  - Skipping empty or non-2D tensor: {key}")
             return {"key": key, "skipped": True, "tensors": {key: original_tensor.to(device="cpu", dtype=original_tensor.dtype)}}
 
+        M, N = original_tensor.shape
+        w_numel = original_tensor.numel()
+        w_min = original_tensor.min().item()
+        w_max = original_tensor.max().item()
+        w_mean = original_tensor.mean().item()
+        w_std = original_tensor.std().item()
+        info(f"  - Weight stats: shape [{M}, {N}] ({w_numel:,} params) | Range: [{w_min:+.4f}, {w_max:+.4f}] | Mean: {w_mean:+.4e} | Std: {w_std:.4f}")
+
         if skip_inefficient_layers:
             should_skip, skip_perf_reason = should_skip_layer_for_performance(original_tensor, block_size)
             if should_skip:
@@ -536,23 +546,38 @@ def convert_to_int4_convrot(
         checkpoint_mgr.save_layer_checkpoint(res_item)
         return res_item
 
+    conv_start_time = time.time()
     layer_results = run_parallel_layer_processing(work_items, process_layer_item, target_devices)
 
     quantized_count = 0
     fallback_count = 0
     fallback_layers_info = []
+    quantized_params = 0
+    fallback_params = 0
+    skipped_params = 0
+    all_metrics = []
 
     for r in layer_results:
         checkpoint_mgr.save_layer_checkpoint(r)
+        m = r.get("metrics", {})
+        numel = m.get("numel", 0)
+        if not numel and "tensors" in r and r.get("key") in r["tensors"]:
+            numel = r["tensors"][r["key"]].numel()
+
         if r.get("skipped"):
             skipped_count += 1
+            skipped_params += numel
         elif r.get("fallback"):
             fallback_count += 1
             fallback_layers_info.append(r)
+            fallback_params += numel
             processed_count += 1
         else:
             quantized_count += 1
+            quantized_params += numel
             processed_count += 1
+            if m:
+                all_metrics.append(m)
 
         if "tensors" in r:
             new_tensors.update(r["tensors"])
@@ -594,14 +619,52 @@ def convert_to_int4_convrot(
     if calib_cache_dir and os.path.exists(calib_cache_dir):
         shutil.rmtree(calib_cache_dir)
 
+    total_elapsed = time.time() - conv_start_time
+    mins = int(total_elapsed // 60)
+    secs = int(total_elapsed % 60)
+    elapsed_str = f"{mins}m {secs:02d}s" if mins > 0 else f"{total_elapsed:.1f}s"
+    avg_speed = total_elapsed / max(processed_count, 1)
+
+    total_params = quantized_params + fallback_params + skipped_params
+    orig_mb = (total_params * 2) / (1024 * 1024) if total_params > 0 else 0
+    quant_mb = (quantized_params * 0.5 + (fallback_params + skipped_params) * 2) / (1024 * 1024) if total_params > 0 else 0
+    comp_ratio = orig_mb / max(quant_mb, 1e-6) if quant_mb > 0 else 1.0
+
     info("-" * 60)
     info("Summary:")
     info(f"  - Original tensor count : {len(all_keys)}")
     info(f"  - Total weights reviewed: {processed_count + skipped_count}")
-    info(f"  - INT4 Quantized layers : {quantized_count}")
-    info(f"  - BF16 Fallback layers  : {fallback_count}")
+    info(f"  - INT4 Quantized layers : {quantized_count} ({quantized_params:,} params)")
+    info(f"  - BF16 Fallback layers  : {fallback_count} ({fallback_params:,} params)")
     info(f"  - Skipped layers        : {skipped_count}")
     info(f"  - Final tensor count    : {len(new_tensors)}")
+    if total_params > 0:
+        info(f"  - Parameter breakdown   : {quantized_params:,} INT4 / {total_params:,} total ({quantized_params / total_params * 100:.1f}% quantized)")
+        info(f"  - Weight memory (est.)  : ~{orig_mb:.2f} MB (BF16) -> ~{quant_mb:.2f} MB ({comp_ratio:.2f}x compression)")
+    info(f"  - Elapsed time          : {elapsed_str} ({avg_speed:.2f}s/layer)")
+
+    if all_metrics:
+        snrs = [m["snr_db"] for m in all_metrics if "snr_db" in m and not math.isinf(m["snr_db"])]
+        cossims = [m["cos_sim"] for m in all_metrics if "cos_sim" in m]
+        nmses = [m["nmse"] for m in all_metrics if "nmse" in m]
+        rmses = [m["rmse"] for m in all_metrics if "rmse" in m]
+        maes = [m["mae"] for m in all_metrics if "mae" in m]
+        deltas = [m["opt_improvement"] for m in all_metrics if m.get("opt_improvement") is not None]
+
+        info("\n  [Aggregate Quantization Quality]:")
+        if snrs:
+            info(f"    * SNR (dB)        : Mean = {sum(snrs)/len(snrs):.2f} dB (Min = {min(snrs):.2f} dB, Max = {max(snrs):.2f} dB)")
+        if cossims:
+            info(f"    * Cosine Sim      : Mean = {sum(cossims)/len(cossims):.4f} (Min = {min(cossims):.4f}, Max = {max(cossims):.4f})")
+        if nmses:
+            info(f"    * NMSE            : Mean = {sum(nmses)/len(nmses):.3e}")
+        if rmses:
+            info(f"    * RMSE            : Mean = {sum(rmses)/len(rmses):.3e}")
+        if maes:
+            info(f"    * MAE             : Mean = {sum(maes)/len(maes):.3e}")
+        if deltas:
+            info(f"    * AdaRound Delta  : Mean = {sum(deltas)/len(deltas):+.2%}")
+
     if fallback_layers_info:
         info("\n  [4-Bit Sensitivity Fallback Breakdown]:")
         for fl in fallback_layers_info:

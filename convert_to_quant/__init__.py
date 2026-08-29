@@ -14,4 +14,11 @@ except Exception:
 
 from .convert_to_quant import main, quantize
 
-__all__ = ["main", "quantize", "__version__"]
+__all__ = ["main", "quantize", "consolidate_calibration_data", "__version__"]
+
+
+def __getattr__(name: str):
+    if name == "consolidate_calibration_data":
+        from .consolidate_calibration import consolidate_calibration_data
+        return consolidate_calibration_data
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

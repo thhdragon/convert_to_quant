@@ -45,6 +45,7 @@ class CalibrationDataLoader:
         self.files: List[str] = []
         self.key_to_files: Dict[str, List[str]] = {}
         self.normalized_to_raw_keys: Dict[str, Set[str]] = {}
+        self.metadata: Dict[str, str] = {}
 
         self._discover_files()
         self._index_keys()
@@ -67,6 +68,10 @@ class CalibrationDataLoader:
         for fpath in self.files:
             try:
                 with safe_open(fpath, framework="pt") as f:
+                    file_meta = f.metadata()
+                    if file_meta:
+                        self.metadata.update(file_meta)
+
                     for k in f.keys():
                         if k not in self.key_to_files:
                             self.key_to_files[k] = []
@@ -79,7 +84,8 @@ class CalibrationDataLoader:
             except Exception as e:
                 warning(f"Error inspecting calibration file '{fpath}': {e}")
 
-        info(f"Indexed {len(self.normalized_to_raw_keys)} unique calibration layer targets across {len(self.files)} files.")
+        meta_info = f" (format: {self.metadata.get('format', 'raw')}, dtype: {self.metadata.get('dtype', 'unknown')})" if self.metadata else ""
+        info(f"Indexed {len(self.normalized_to_raw_keys)} unique calibration layer targets across {len(self.files)} files{meta_info}.")
 
     def has_layer(self, weight_key: str) -> bool:
         """Check if calibration data is available for a given weight key."""

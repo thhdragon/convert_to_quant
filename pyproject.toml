@@ -43,6 +43,8 @@ dev = ["pytest"]
 convert_to_quant = "convert_to_quant.convert_to_quant:main"
 convert-to-quant = "convert_to_quant.convert_to_quant:main"
 ctq = "convert_to_quant.convert_to_quant:main"
+consolidate_calibration = "convert_to_quant.consolidate_calibration:main"
+consolidate-calibration = "convert_to_quant.consolidate_calibration:main"
 
 [project.urls]
 Repository = "https://github.com/silveroxides/convert_to_quant"
